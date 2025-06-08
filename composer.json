@@ -1,0 +1,54 @@
+{
+  "name": "tronwallet/mobile-app",
+  "description": "TRON Wallet Mobile Application - Secure cryptocurrency wallet for TRX",
+  "type": "project",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "TRON Wallet Team",
+      "email": "dev@tronwallet.com"
+    }
+  ],
+  "require": {
+    "php": "^7.3 || ^8.0",
+    "firebase/php-jwt": "^6.8",
+    "guzzlehttp/guzzle": "^7.9",
+    "iexbase/tron-api": "^5.0",
+    "phpmailer/phpmailer": "^6.8",
+    "ramsey/uuid": "^4.7",
+    "vlucas/phpdotenv": "^5.5"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^9.6",
+    "squizlabs/php_codesniffer": "^3.7"
+  },
+  "autoload": {
+    "psr-4": {
+      "TronWallet\\": "src/",
+      "TronWallet\\Components\\": "components/",
+      "TronWallet\\Utils\\": "utils/",
+      "TronWallet\\Config\\": "config/"
+    },
+    "files": ["config/security.php"]
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "TronWallet\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit",
+    "cs-check": "phpcs --standard=PSR12 src/",
+    "cs-fix": "phpcbf --standard=PSR12 src/",
+    "post-install-cmd": ["@php -r \"if (!file_exists('.env')) copy('.env.example', '.env');\""]
+  },
+  "config": {
+    "optimize-autoloader": true,
+    "sort-packages": true,
+    "allow-plugins": {
+      "composer/package-versions-deprecated": true
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
+}
