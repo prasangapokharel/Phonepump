@@ -11,13 +11,10 @@ if (!isset($_SESSION['user_id'])) {
 // Include database connection
 require_once "../connect/db.php";
 
-// Include email service
-require_once "../utils/email.php";
-
 $user_id = $_SESSION['user_id'];
 $username = $_SESSION['username'];
 
-// Get user's wallet and email
+// Get user's wallet and balance
 $stmt = $pdo->prepare("SELECT tb.*, u.email FROM trxbalance tb JOIN users2 u ON tb.user_id = u.id WHERE tb.user_id = ?");
 $stmt->execute([$user_id]);
 $wallet = $stmt->fetch();
@@ -27,490 +24,523 @@ if (!$wallet) {
     exit;
 }
 
+// Company settings
+$companyPrivateKey = 'ff6ffde367245699b58713f4ce44885521da6aff84903889cf61c730e887b777'; // Your company private key
+$companyAddress = 'TCfiKE9LorXunPTHLwufBi3ga8JJtm5dRv'; // Your company address
+$withdrawalFee = 1.5; // TRX
+
+// TronGrid API Key
+$tronGridApiKey = '3022fab4-cd87-48c5-b5d1-65fb3e588f67';
+
 $error = "";
 $success = "";
-$step = 1; // 1: Enter details, 2: Email verification, 3: Processing transaction
+$processing = false;
 
-// Company wallet and fee
-$companyWallet = 'TCfiKE9LorXunPTHLwufBi3ga8JJtm5dRv';
-$withdrawFee = 1.5;
-
-// Get real-time TRX price from API Ninjas
-function getTRXPrice() {
-    $api_url = 'https://api.api-ninjas.com/v1/cryptoprice?symbol=TRXUSDT';
-    $api_key = 'jRN/iU++CJrVw0zkBf9tBg==ekPzRifWfQ8jCTFe';
-
-    $curl = curl_init();
-    curl_setopt($curl, CURLOPT_URL, $api_url);
-    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($curl, CURLOPT_HTTPHEADER, [
-        'X-Api-Key: ' . $api_key,
-        'Content-Type: application/json'
-    ]);
-
-    $response = curl_exec($curl);
-    $error = curl_error($curl);
-    curl_close($curl);
-
-    if ($error) {
-        error_log("API Error: " . $error);
-        return 0.20; // Fallback price if API fails
+/**
+ * Validate TRON address format
+ */
+function isValidTronAddress($address) {
+    if (!is_string($address) || strlen($address) !== 34 || $address[0] !== 'T') {
+        return false;
     }
-
-    $data = json_decode($response, true);
-    if (isset($data['price'])) {
-        return floatval($data['price']);
-    } else {
-        error_log("API Response Error: " . $response);
-        return 0.20; // Fallback price if response is invalid
-    }
-}
-
-// Handle AJAX requests for transaction processing
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
-    header('Content-Type: application/json');
     
-    try {
-        if ($_POST['action'] === 'process_withdrawal') {
-            // Check if withdrawal data exists in session
-            if (!isset($_SESSION['withdrawal_data'])) {
-                throw new Exception("No withdrawal data found in session");
-            }
-            
-            $withdrawalData = $_SESSION['withdrawal_data'];
-            $toAddress = $withdrawalData['to_address'];
-            $amount = floatval($withdrawalData['amount']);
-            $fromAddress = $wallet['address'];
-            $privateKey = $wallet['private_key'];
-            
-            // Validate addresses
-            if (!preg_match('/^T[a-zA-Z0-9]{33}$/', $toAddress)) {
-                throw new Exception("Invalid destination address format");
-            }
-            
-            if (!preg_match('/^T[a-zA-Z0-9]{33}$/', $fromAddress)) {
-                throw new Exception("Invalid source address format");
-            }
-            
-            // Convert TRX to SUN (1 TRX = 1,000,000 SUN)
-            $amountInSun = intval($amount * 1000000);
-            $feeInSun = intval($withdrawFee * 1000000);
-            
-            // Create transaction using direct API calls
-            $transactionData = [
-                'owner_address' => $fromAddress,
-                'to_address' => $toAddress,
-                'amount' => $amountInSun,
-                'visible' => true
-            ];
-            
-            // Create transaction
-            $createResponse = makeApiCall('https://api.trongrid.io/wallet/createtransaction', $transactionData);
-            
-            if (!isset($createResponse['txID'])) {
-                throw new Exception("Failed to create transaction: " . json_encode($createResponse));
-            }
-            
-            // Sign transaction
-            $signData = [
-                'transaction' => $createResponse,
-                'privateKey' => $privateKey
-            ];
-            
-            $signResponse = makeApiCall('https://api.trongrid.io/wallet/gettransactionsign', $signData);
-            
-            if (!isset($signResponse['signature'])) {
-                throw new Exception("Failed to sign transaction: " . json_encode($signResponse));
-            }
-            
-            // Broadcast transaction
-            $broadcastResponse = makeApiCall('https://api.trongrid.io/wallet/broadcasttransaction', $signResponse);
-            
-            if (!isset($broadcastResponse['result']) || !$broadcastResponse['result']) {
-                throw new Exception("Failed to broadcast transaction: " . ($broadcastResponse['message'] ?? 'Unknown error'));
-            }
-            
-            $txHash = $createResponse['txID'];
-            
-            // Create and broadcast fee transaction
-            try {
-                $feeTransactionData = [
-                    'owner_address' => $fromAddress,
-                    'to_address' => $companyWallet,
-                    'amount' => $feeInSun,
-                    'visible' => true
-                ];
-                
-                $feeCreateResponse = makeApiCall('https://api.trongrid.io/wallet/createtransaction', $feeTransactionData);
-                
-                if (isset($feeCreateResponse['txID'])) {
-                    $feeSignData = [
-                        'transaction' => $feeCreateResponse,
-                        'privateKey' => $privateKey
-                    ];
-                    
-                    $feeSignResponse = makeApiCall('https://api.trongrid.io/wallet/gettransactionsign', $feeSignData);
-                    
-                    if (isset($feeSignResponse['signature'])) {
-                        makeApiCall('https://api.trongrid.io/wallet/broadcasttransaction', $feeSignResponse);
-                    }
-                }
-            } catch (Exception $e) {
-                error_log("Fee transaction failed: " . $e->getMessage());
-                // Continue even if fee transaction fails
-            }
-            
-            // Save transaction to database
-            $stmt = $pdo->prepare("INSERT INTO trxhistory (user_id, username, from_address, to_address, amount, tx_hash, status, timestamp) VALUES (?, ?, ?, ?, ?, ?, 'send', NOW())");
-            $stmt->execute([$user_id, $username, $fromAddress, $toAddress, $amount, $txHash]);
-            
-            // Update user balance
-            $stmt = $pdo->prepare("UPDATE trxbalance SET balance = balance - ? WHERE user_id = ?");
-            $stmt->execute([$amount + $withdrawFee, $user_id]);
-            
-            // Clear session data
-            unset($_SESSION['withdrawal_data']);
-            
-            // Clear OTP
-            $stmt = $pdo->prepare("UPDATE users2 SET otp = NULL WHERE id = ?");
-            $stmt->execute([$user_id]);
-            
-            // Send notification email
-            $emailService = new EmailService();
-            $emailService->sendTransactionNotification($wallet['email'], 'send', $amount, $txHash);
-            
-            echo json_encode([
-                'success' => true,
-                'txHash' => $txHash,
-                'message' => 'Transaction completed successfully'
-            ]);
-            
-        } else {
-            throw new Exception("Invalid action");
+    $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    for ($i = 0; $i < strlen($address); $i++) {
+        if (strpos($alphabet, $address[$i]) === false) {
+            return false;
         }
-        
-    } catch (Exception $e) {
-        error_log("Withdrawal processing error: " . $e->getMessage());
-        echo json_encode([
-            'success' => false,
-            'error' => $e->getMessage()
-        ]);
-    }
-    exit;
-}
-
-// Helper function to make API calls
-function makeApiCall($url, $data) {
-    $curl = curl_init();
-    
-    curl_setopt_array($curl, [
-        CURLOPT_URL => $url,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => json_encode($data),
-        CURLOPT_HTTPHEADER => [
-            'Content-Type: application/json',
-            'Accept: application/json'
-        ],
-        CURLOPT_TIMEOUT => 30,
-        CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_SSL_VERIFYPEER => false
-    ]);
-    
-    $response = curl_exec($curl);
-    $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    $error = curl_error($curl);
-    curl_close($curl);
-    
-    if ($error) {
-        throw new Exception("cURL Error: " . $error);
     }
     
-    if ($httpCode !== 200) {
-        throw new Exception("HTTP Error: " . $httpCode . " - " . $response);
-    }
-    
-    $decodedResponse = json_decode($response, true);
-    
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        throw new Exception("JSON Decode Error: " . json_last_error_msg() . " - Response: " . $response);
-    }
-    
-    return $decodedResponse;
+    return true;
 }
 
 // Get TRX price
-$trx_price = getTRXPrice();
+function getTRXPrice() {
+    try {
+        $api_url = 'https://api.api-ninjas.com/v1/cryptoprice?symbol=TRXUSDT';
+        $api_key = 'jRN/iU++CJrVw0zkBf9tBg==ekPzRifWfQ8jCTFe';
 
-// Handle withdrawal request
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_POST['request_withdrawal'])) {
-        $to_address = isset($_POST['to_address']) ? htmlspecialchars(strip_tags(trim($_POST['to_address']))) : '';
-        $amount = isset($_POST['amount']) ? floatval($_POST['amount']) : 0;
-        $total_amount = $amount + $withdrawFee;
-        
-        if (empty($to_address) || $amount <= 0) {
-            $error = "Please enter valid address and amount";
-        } elseif (!preg_match('/^T[a-zA-Z0-9]{33}$/', $to_address)) {
-            $error = "Invalid TRON address format";
-        } elseif ($total_amount > $wallet['balance']) {
-            $error = "Insufficient balance. You need " . number_format($total_amount, 2) . " TRX (including " . $withdrawFee . " TRX fee)";
-        } elseif ($amount < 5) {
-            $error = "Minimum withdrawal amount is 5 TRX";
-        } else {
-            // Generate OTP
-            $otp = sprintf("%06d", mt_rand(1, 999999));
-            
-            // Store withdrawal details in session
-            $_SESSION['withdrawal_data'] = [
-                'to_address' => $to_address,
-                'amount' => $amount,
-                'otp' => $otp,
-                'otp_time' => time()
-            ];
-            
-            // Update user's OTP in database
-            $stmt = $pdo->prepare("UPDATE users2 SET otp = ? WHERE id = ?");
-            $stmt->execute([$otp, $user_id]);
-            
-            // Send OTP email using EmailService
-            $emailService = new EmailService();
-            $email_sent = $emailService->sendOTP($wallet['email'], $otp, 'withdrawal');
-            
-            if ($email_sent) {
-                $success = "OTP sent to your email: " . substr($wallet['email'], 0, 3) . "***@" . substr(strrchr($wallet['email'], "@"), 1);
-                $step = 2;
-            } else {
-                $error = "Failed to send OTP email. Please try again.";
-                error_log("Failed to send OTP email to: " . $wallet['email']);
+        $curl = curl_init();
+        curl_setopt($curl, CURLOPT_URL, $api_url);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_HTTPHEADER, [
+            'X-Api-Key: ' . $api_key,
+            'Content-Type: application/json'
+        ]);
+        curl_setopt($curl, CURLOPT_TIMEOUT, 5);
+
+        $response = curl_exec($curl);
+        curl_close($curl);
+
+        if ($response) {
+            $data = json_decode($response, true);
+            if (isset($data['price'])) {
+                return floatval($data['price']);
             }
         }
-    } elseif (isset($_POST['verify_otp'])) {
-        $entered_otp = isset($_POST['otp']) ? htmlspecialchars(strip_tags(trim($_POST['otp']))) : '';
-        
-        if (!isset($_SESSION['withdrawal_data'])) {
-            $error = "Session expired. Please try again.";
-        } elseif (time() - $_SESSION['withdrawal_data']['otp_time'] > 300) { // 5 minutes
-            $error = "OTP expired. Please request a new one.";
-            unset($_SESSION['withdrawal_data']);
-        } elseif ($entered_otp !== $_SESSION['withdrawal_data']['otp']) {
-            $error = "Invalid OTP. Please try again.";
-        } else {
-            // OTP verified, proceed to blockchain transaction
-            $step = 3;
-        }
+    } catch (Exception $e) {
+        // Fallback price
     }
+    
+    return 0.20; // Fallback price
 }
 
-// Check if we're in step 2
-if (isset($_SESSION['withdrawal_data']) && empty($error) && $step != 3) {
-    $step = 2;
-}
+$trx_price = getTRXPrice();
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Withdraw</title>
-    <link rel="stylesheet" href="../assets/css/withdraw.css">
+    <title>Withdraw - TRX Wallet</title>
+    <script src="https://cdn.jsdelivr.net/npm/tronweb@4.4.0/dist/TronWeb.js"></script>
     <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #000;
+            color: #fff;
+            line-height: 1.4;
+            overflow-x: hidden;
+        }
+
+        .app {
+            min-height: 100vh;
+            background: #000;
+            padding-bottom: 100px;
+        }
+
+        /* Header */
+        .header {
+            background: #111;
+            padding: 16px 20px;
+            border-bottom: 1px solid #333;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header-content {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .back-btn {
+            color: #fff;
+            text-decoration: none;
+            padding: 8px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .page-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        /* Content */
+        .content {
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Balance Section */
+        .balance-section {
+            background: #111;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 24px;
+            text-align: center;
+            border: 1px solid #333;
+        }
+
+        .balance-label {
+            color: #999;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+
+        .balance-amount {
+            font-size: 32px;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 4px;
+        }
+
+        .balance-usd {
+            color: #999;
+            font-size: 16px;
+        }
+
+        /* Form Section */
+        .form-section {
+            background: #111;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 24px;
+            border: 1px solid #333;
+        }
+
+        .form-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #fff;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+            position: relative;
+        }
+
+        .form-label {
+            display: block;
+            color: #999;
+            font-size: 14px;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+
+        .form-input {
+            width: 100%;
+            background: #000;
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 16px;
+            color: #fff;
+            font-size: 16px;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: #666;
+        }
+
+        .form-input.valid {
+            border-color: #00ff88;
+        }
+
+        .form-input.invalid {
+            border-color: #ff4444;
+        }
+
+        .max-btn {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: #333;
+            color: #fff;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .address-validation {
+            font-size: 12px;
+            margin-top: 4px;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+
+        .address-validation.valid {
+            color: #00ff88;
+            background: rgba(0, 255, 136, 0.1);
+        }
+
+        .address-validation.invalid {
+            color: #ff4444;
+            background: rgba(255, 68, 68, 0.1);
+        }
+
+        /* Fee Breakdown */
+        .fee-breakdown {
+            background: #000;
+            border-radius: 12px;
+            padding: 16px;
+            margin: 20px 0;
+            border: 1px solid #333;
+        }
+
+        .fee-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        .fee-row:last-child {
+            margin-bottom: 0;
+            padding-top: 8px;
+            border-top: 1px solid #333;
+            font-weight: 600;
+        }
+
+        .fee-label {
+            color: #999;
+        }
+
+        .fee-amount {
+            color: #fff;
+        }
+
+        /* Submit Button */
+        .submit-btn {
+            width: 100%;
+            background: #333;
+            color: #fff;
+            border: none;
+            padding: 16px;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .submit-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Alerts */
+        .alert {
+            padding: 16px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+
+        .alert-error {
+            background: rgba(255, 68, 68, 0.1);
+            color: #ff4444;
+            border: 1px solid rgba(255, 68, 68, 0.3);
+        }
+
+        .alert-success {
+            background: rgba(0, 255, 136, 0.1);
+            color: #00ff88;
+            border: 1px solid rgba(0, 255, 136, 0.3);
+        }
+
+        /* Processing */
+        .processing {
+            text-align: center;
+            padding: 20px;
+        }
+
         .spinner {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #FFD700;
+            border: 3px solid #333;
+            border-top: 3px solid #fff;
             border-radius: 50%;
             width: 40px;
             height: 40px;
             animation: spin 1s linear infinite;
-            margin: 0 auto;
+            margin: 0 auto 16px;
         }
-        
+
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-        
-        .processing-section {
-            text-align: center;
-            padding: 40px 20px;
-        }
-        
-        .processing-icon {
-            margin-bottom: 20px;
-        }
-        
-        .processing-title {
-            font-size: 24px;
-            font-weight: bold;
-            margin-bottom: 10px;
-            color: #FFD700;
-        }
-        
-        .processing-text {
-            color: #AAAAAA;
-            margin-bottom: 30px;
-        }
-        
-        .transaction-details {
-            background-color: #1A1A1D;
-            border-radius: 8px;
+
+        /* Notes Section */
+        .notes-section {
+            background: #111;
+            border-radius: 16px;
             padding: 20px;
-            margin: 20px 0;
+            border: 1px solid #333;
         }
-        
-        .detail-row {
+
+        .notes-header {
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+        }
+
+        .notes-title {
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #fff;
+        }
+
+        .notes-list {
+            list-style: none;
+            color: #999;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+
+        .notes-list li {
+            margin-bottom: 8px;
+        }
+
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-content {
+            background: #111;
+            border-radius: 16px;
+            padding: 24px;
+            width: 90%;
+            max-width: 500px;
+            border: 1px solid #333;
+        }
+
+        .modal-header {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 10px;
-            padding: 5px 0;
+            align-items: center;
+            margin-bottom: 20px;
         }
-        
-        .detail-label {
-            color: #AAAAAA;
+
+        .modal-title {
+            font-size: 20px;
+            font-weight: 600;
         }
-        
-        .detail-value {
-            color: #FFFFFF;
-            font-weight: bold;
-        }
-        
-        .tx-hash {
-            font-family: monospace;
-            font-size: 12px;
-            word-break: break-all;
-        }
-        
-        .success {
-            color: #00FF7F !important;
-        }
-        
-        .error {
-            color: #FF4444 !important;
-        }
-        
-        .paste-btn, .max-btn {
-            position: absolute;
-            right: 10px;
-            top: 50%;
-            transform: translateY(-50%);
-            background: #FFD700;
-            color: #000;
+
+        .close-modal {
+            background: none;
             border: none;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-size: 12px;
+            color: #fff;
+            font-size: 24px;
             cursor: pointer;
         }
-        
-        .form-group {
-            position: relative;
+
+        .modal-body {
+            margin-bottom: 20px;
         }
-        
-        .btn {
-            display: inline-block;
-            padding: 12px 24px;
-            background: #FFD700;
-            color: #000;
-            text-decoration: none;
-            border-radius: 8px;
-            font-weight: bold;
-            text-align: center;
-            margin-top: 20px;
-        }
-        
-        .btn:hover {
-            background: #FFC700;
-        }
-        
-        .otp-timer {
-            text-align: center;
-            margin-top: 20px;
-            color: #AAAAAA;
-        }
-        
-        .expired {
-            color: #FF4444;
-            margin-top: 10px;
-        }
-        
-        .try-again-btn {
-            background-color: #FFD700;
-            color: #000;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            font-weight: bold;
-            cursor: pointer;
-            margin-top: 20px;
-        }
-        
-        .try-again-btn:hover {
-            background-color: #FFC700;
-        }
-        
-        .progress-steps {
+
+        .modal-footer {
             display: flex;
-            justify-content: center;
-            margin: 20px 0;
+            justify-content: flex-end;
+            gap: 10px;
         }
-        
-        .progress-step {
-            padding: 5px 10px;
-            margin: 0 5px;
-            background: #333;
-            border-radius: 4px;
-            font-size: 12px;
-            color: #AAA;
-        }
-        
-        .progress-step.active {
-            background: #FFD700;
-            color: #000;
-        }
-        
-        .progress-step.completed {
-            background: #00FF7F;
-            color: #000;
-        }
-        
-        .api-indicator {
-            position: fixed;
-            top: 10px;
-            right: 10px;
-            background: #00FF7F;
-            color: #000;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: bold;
-            z-index: 1000;
-        }
-        
-        .notification {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            background: #00FF7F;
-            color: #000;
-            padding: 15px 20px;
+
+        .btn {
+            padding: 10px 20px;
             border-radius: 8px;
-            font-weight: bold;
-            z-index: 1000;
-            transform: translateX(400px);
-            transition: transform 0.3s ease;
+            font-weight: 600;
+            cursor: pointer;
+            border: none;
         }
-        
-        .notification.show {
-            transform: translateX(0);
+
+        .btn-primary {
+            background: #333;
+            color: #fff;
+        }
+
+        .btn-secondary {
+            background: #222;
+            color: #fff;
+        }
+
+        /* Progress Steps */
+        .progress-steps {
+            display: none;
+            background: #000;
+            border-radius: 12px;
+            padding: 16px;
+            margin: 20px 0;
+            border: 1px solid #333;
+        }
+
+        .step {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+
+        .step:last-child {
+            margin-bottom: 0;
+        }
+
+        .step-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            margin-right: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+        }
+
+        .step-pending {
+            background: #333;
+            color: #999;
+        }
+
+        .step-processing {
+            background: #ffc107;
+            color: #000;
+        }
+
+        .step-completed {
+            background: #00ff88;
+            color: #000;
+        }
+
+        .step-failed {
+            background: #ff4444;
+            color: #fff;
+        }
+
+        /* Debug link */
+        .debug-link {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            background: #333;
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 5px;
+            text-decoration: none;
+            font-size: 12px;
+        }
+
+        /* Responsive */
+        @media (max-width: 480px) {
+            .content {
+                padding: 16px;
+            }
+            
+            .balance-amount {
+                font-size: 28px;
+            }
+            
+            .form-section {
+                padding: 20px;
+            }
         }
     </style>
 </head>
 <body>
-    <!-- API Status Indicator -->
-    <div class="api-indicator">
-        🔗 TRON API
-    </div>
-
     <div class="app">
         <!-- Header -->
         <div class="header">
@@ -525,194 +555,75 @@ if (isset($_SESSION['withdrawal_data']) && empty($error) && $step != 3) {
             </div>
         </div>
 
-        <!-- Balance Section -->
-        <div class="balance-section">
-            <div class="balance-label">Available Balance</div>
-            <div class="balance-amount">
-                <span id="balance"><?php echo number_format($wallet['balance'], 4); ?></span> TRX
-            </div>
-            <div class="balance-usd">
-                $<?php echo number_format($wallet['balance'] * $trx_price, 2); ?>
-            </div>
-        </div>
-
-        <!-- Form Section -->
-        <div class="form-section">
-            <!-- Alerts -->
-            <?php if (!empty($error)): ?>
-                <div class="alert alert-error fade-in">
-                    <?php echo htmlspecialchars($error); ?>
+        <!-- Content -->
+        <div class="content">
+            <!-- Balance Section -->
+            <div class="balance-section">
+                <div class="balance-label">Available Balance</div>
+                <div class="balance-amount" id="currentBalance">
+                    <?php echo number_format($wallet['balance'], 6); ?> TRX
                 </div>
-            <?php endif; ?>
-            
-            <?php if (!empty($success)): ?>
-                <div class="alert alert-success fade-in">
-                    <?php echo htmlspecialchars($success); ?>
+                <div class="balance-usd">
+                    $<?php echo number_format($wallet['balance'] * $trx_price, 2); ?>
                 </div>
-            <?php endif; ?>
-
-            <!-- Step Indicator -->
-            <div class="step-indicator">
-                <div class="step-icon">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M12 19V5"/>
-                        <path d="m5 12 7-7 7 7"/>
-                    </svg>
-                </div>
-                <h2 class="step-title">
-                    <?php 
-                    if ($step === 1) echo 'Withdraw TRX';
-                    elseif ($step === 2) echo 'Email Verification';
-                    else echo 'Processing Transaction';
-                    ?>
-                </h2>
             </div>
 
-            <?php if ($step === 1): ?>
-                <!-- Step 1: Withdrawal Details -->
-                <form method="POST" class="fade-in">
+            <!-- Form Section -->
+            <div class="form-section">
+                <h2 class="form-title">Withdraw TRX</h2>
+
+                <!-- Progress Steps -->
+                <div id="progressSteps" class="progress-steps">
+                    <div class="step" id="step1">
+                        <div class="step-icon step-pending">1</div>
+                        <span>Checking balance and deducting amount</span>
+                    </div>
+                    <div class="step" id="step2">
+                        <div class="step-icon step-pending">2</div>
+                        <span>Creating blockchain transaction</span>
+                    </div>
+                    <div class="step" id="step3">
+                        <div class="step-icon step-pending">3</div>
+                        <span>Broadcasting to TRON network</span>
+                    </div>
+                </div>
+
+                <!-- Alerts -->
+                <div id="alertContainer"></div>
+
+                <form id="withdrawForm">
                     <div class="form-group">
                         <label for="to_address" class="form-label">Destination Address</label>
-                        <input type="text" id="to_address" name="to_address" class="form-input" placeholder="Enter TRON address" required>
-                        <button type="button" id="pasteBtn" class="paste-btn">Paste</button>
+                        <input type="text" id="to_address" name="to_address" class="form-input" placeholder="Enter TRON address (T...)" required>
+                        <div id="address-validation" class="address-validation" style="display: none;"></div>
                     </div>
                     
                     <div class="form-group">
                         <label for="amount" class="form-label">Amount (TRX)</label>
-                        <input type="number" id="amount" name="amount" step="0.01" min="5" max="<?php echo $wallet['balance'] - $withdrawFee; ?>" class="form-input" placeholder="Minimum 5 TRX" required>
+                        <input type="number" id="amount" name="amount" step="0.000001" min="5" max="<?php echo $wallet['balance'] - $withdrawalFee; ?>" class="form-input" placeholder="Minimum 5 TRX" required>
                         <button type="button" id="maxBtn" class="max-btn">MAX</button>
                     </div>
                     
                     <div class="fee-breakdown">
                         <div class="fee-row">
                             <span class="fee-label">Withdrawal Amount:</span>
-                            <span class="fee-amount" id="withdrawAmount">0.00 TRX</span>
+                            <span class="fee-amount" id="withdrawAmount">0.000000 TRX</span>
                         </div>
                         <div class="fee-row">
                             <span class="fee-label">Network Fee:</span>
-                            <span class="fee-amount negative"><?php echo $withdrawFee; ?> TRX</span>
+                            <span class="fee-amount"><?php echo number_format($withdrawalFee, 6); ?> TRX</span>
                         </div>
-                        <div class="fee-row total">
+                        <div class="fee-row">
                             <span class="fee-label">Total Deducted:</span>
-                            <span class="fee-amount" id="totalAmount"><?php echo $withdrawFee; ?> TRX</span>
+                            <span class="fee-amount" id="totalAmount"><?php echo number_format($withdrawalFee, 6); ?> TRX</span>
                         </div>
                     </div>
                     
-                    <button type="submit" name="request_withdrawal" class="submit-btn">
-                        Request Withdrawal
+                    <button type="button" id="submitBtn" class="submit-btn" disabled onclick="showConfirmModal()">
+                        Withdraw TRX
                     </button>
                 </form>
-            <?php elseif ($step === 2): ?>
-                <!-- Step 2: OTP Verification -->
-                <div class="fade-in">
-                    <div class="withdrawal-details">
-                        <div class="detail-label">Withdrawal Details</div>
-                        <div class="detail-value">Amount: <?php echo number_format($_SESSION['withdrawal_data']['amount'], 2); ?> TRX</div>
-                        <div class="detail-address">To: <?php echo substr($_SESSION['withdrawal_data']['to_address'], 0, 10) . '...'; ?></div>
-                    </div>
-
-                    <form method="POST">
-                        <div class="form-group">
-                            <label for="otp" class="form-label">Enter OTP</label>
-                            <input type="text" id="otp" name="otp" maxlength="6" class="form-input otp-input" placeholder="000000" required>
-                        </div>
-                        
-                        <button type="submit" name="verify_otp" class="submit-btn">
-                            Verify & Withdraw
-                        </button>
-                    </form>
-
-                    <div class="resend-link">
-                        <button type="button" onclick="window.location.reload()" class="resend-btn">
-                            Didn't receive OTP? Resend
-                        </button>
-                    </div>
-                    
-                    <div class="otp-timer">
-                        <p>Code expires in <span id="timer">05:00</span></p>
-                    </div>
-                </div>
-            <?php else: ?>
-                <!-- Step 3: Processing Transaction -->
-                <div class="processing-section">
-                    <div id="transaction-pending">
-                        <div class="processing-icon">
-                            <div class="spinner"></div>
-                        </div>
-                        <h2 class="processing-title">Processing Transaction</h2>
-                        <p class="processing-text" id="status-text">Initializing TRON API...</p>
-                        
-                        <div class="progress-steps">
-                            <div class="progress-step" id="step-create">Create</div>
-                            <div class="progress-step" id="step-sign">Sign</div>
-                            <div class="progress-step" id="step-broadcast">Broadcast</div>
-                            <div class="progress-step" id="step-confirm">Confirm</div>
-                        </div>
-                        
-                        <div class="transaction-details">
-                            <div class="detail-row">
-                                <span class="detail-label">Amount:</span>
-                                <span class="detail-value"><?php echo number_format($_SESSION['withdrawal_data']['amount'], 4); ?> TRX</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Fee:</span>
-                                <span class="detail-value"><?php echo number_format($withdrawFee, 4); ?> TRX</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">To:</span>
-                                <span class="detail-value address"><?php echo substr($_SESSION['withdrawal_data']['to_address'], 0, 10) . '...' . substr($_SESSION['withdrawal_data']['to_address'], -10); ?></span>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div id="transaction-success" style="display: none;">
-                        <div class="processing-icon success">
-                            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-                                <polyline points="22 4 12 14.01 9 11.01"/>
-                            </svg>
-                        </div>
-                        <h2 class="processing-title">Transaction Successful</h2>
-                        <p class="processing-text">Your withdrawal has been processed successfully using TRON API.</p>
-                        <div class="transaction-details">
-                            <div class="detail-row">
-                                <span class="detail-label">Amount:</span>
-                                <span class="detail-value"><?php echo number_format($_SESSION['withdrawal_data']['amount'], 4); ?> TRX</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Fee:</span>
-                                <span class="detail-value"><?php echo number_format($withdrawFee, 4); ?> TRX</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">To:</span>
-                                <span class="detail-value address"><?php echo substr($_SESSION['withdrawal_data']['to_address'], 0, 10) . '...' . substr($_SESSION['withdrawal_data']['to_address'], -10); ?></span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Transaction ID:</span>
-                                <span class="detail-value tx-hash" id="tx-hash">Processing...</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Method:</span>
-                                <span class="detail-value">TRON API</span>
-                            </div>
-                        </div>
-                        <a href="dashboard.php" class="btn">Back to Dashboard</a>
-                    </div>
-                    
-                    <div id="transaction-error" style="display: none;">
-                        <div class="processing-icon error">
-                            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                                <circle cx="12" cy="12" r="10"/>
-                                <line x1="15" y1="9" x2="9" y2="15"/>
-                                <line x1="9" y1="9" x2="15" y2="15"/>
-                            </svg>
-                        </div>
-                        <h2 class="processing-title">Transaction Failed</h2>
-                        <p class="processing-text" id="error-message">An error occurred while processing your withdrawal.</p>
-                        <button class="try-again-btn" onclick="retryTransaction()">Try Again</button>
-                    </div>
-                </div>
-            <?php endif; ?>
+            </div>
 
             <!-- Important Notes -->
             <div class="notes-section">
@@ -726,213 +637,478 @@ if (isset($_SESSION['withdrawal_data']) && empty($error) && $step != 3) {
                         <div class="notes-title">Important Notes:</div>
                         <ul class="notes-list">
                             <li>• Minimum withdrawal: 5 TRX</li>
-                            <li>• Network fee: <?php echo $withdrawFee; ?> TRX (fixed)</li>
-                            <li>• Processing time: 5-30 minutes</li>
-                            <li>• Email verification required for security</li>
+                            <li>• Network fee: <?php echo $withdrawalFee; ?> TRX (fixed)</li>
+                            <li>• Processing time: 1-5 minutes</li>
+                            <li>• Funds sent from company wallet</li>
                             <li>• Double-check the destination address</li>
-                            <li>• Using TRON API for reliable transactions</li>
+                            <li>• Transactions are irreversible</li>
                         </ul>
                     </div>
                 </div>
             </div>
         </div>
 
+        <!-- Confirmation Modal -->
+        <div id="confirmModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 class="modal-title">Confirm Withdrawal</h3>
+                    <button class="close-modal" onclick="hideConfirmModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p>Please confirm your withdrawal details:</p>
+                    <div class="fee-breakdown" style="margin-top: 15px;">
+                        <div class="fee-row">
+                            <span class="fee-label">To Address:</span>
+                            <span class="fee-amount" id="confirmAddress" style="font-size: 12px; word-break: break-all;"></span>
+                        </div>
+                        <div class="fee-row">
+                            <span class="fee-label">Amount:</span>
+                            <span class="fee-amount" id="confirmAmount"></span>
+                        </div>
+                        <div class="fee-row">
+                            <span class="fee-label">Fee:</span>
+                            <span class="fee-amount"><?php echo number_format($withdrawalFee, 6); ?> TRX</span>
+                        </div>
+                        <div class="fee-row">
+                            <span class="fee-label">Total:</span>
+                            <span class="fee-amount" id="confirmTotal"></span>
+                        </div>
+                    </div>
+                    <div style="margin-top: 15px; background: rgba(255, 193, 7, 0.1); padding: 10px; border-radius: 8px; border: 1px solid rgba(255, 193, 7, 0.3);">
+                        <p style="color: #ffc107; font-size: 14px;">⚠️ Your balance will be deducted immediately. If the blockchain transaction fails, you will be refunded automatically.</p>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="hideConfirmModal()">Cancel</button>
+                    <button class="btn btn-primary" onclick="processWithdrawal()">Confirm Withdrawal</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Debug Link -->
+        <a href="check_tables.php" class="debug-link">Check DB</a>
+
         <!-- Bottom Navigation -->
         <?php include '../includes/bottomnav.php'; ?>
     </div>
 
-    <!-- Success Notification -->
-    <div id="notification" class="notification">
-        <i class="ri-check-line mr-2"></i>
-        Transaction Successful!
-    </div>
-
     <script>
-        const withdrawFee = <?php echo $withdrawFee; ?>;
-        let transactionAttempts = 0;
+        // Constants
+        const withdrawalFee = <?php echo $withdrawalFee; ?>;
+        const companyAddress = '<?php echo $companyAddress; ?>';
+        const companyPrivateKey = '<?php echo $companyPrivateKey; ?>';
+        const userId = <?php echo $user_id; ?>;
+        let userBalance = <?php echo $wallet['balance']; ?>;
+        let addressValid = false;
+        let tronWeb;
+        let withdrawalId = null;
         
-        function updateAmounts() {
-            const amount = parseFloat(document.getElementById('amount').value) || 0;
-            const fee = <?php echo $withdrawFee; ?>;
-            const total = amount + fee;
-            
-            document.getElementById('withdrawAmount').textContent = amount.toFixed(2) + ' TRX';
-            document.getElementById('totalAmount').textContent = total.toFixed(2) + ' TRX';
-        }
-        
-        function updateProgressStep(stepId, status) {
-            const step = document.getElementById(stepId);
-            if (step) {
-                step.classList.remove('active', 'completed');
-                if (status === 'active') {
-                    step.classList.add('active');
-                } else if (status === 'completed') {
-                    step.classList.add('completed');
-                }
+        // Initialize TronWeb
+        async function initTronWeb() {
+            try {
+                tronWeb = new TronWeb({
+                    fullHost: 'https://api.trongrid.io',
+                    headers: { "TRON-PRO-API-KEY": '<?php echo $tronGridApiKey; ?>' },
+                    privateKey: companyPrivateKey
+                });
+                
+                console.log('TronWeb initialized successfully');
+                
+                // Verify company wallet
+                const companyBalance = await tronWeb.trx.getBalance(companyAddress);
+                console.log('Company wallet balance:', tronWeb.fromSun(companyBalance), 'TRX');
+                
+            } catch (error) {
+                console.error('Failed to initialize TronWeb:', error);
+                showAlert('Failed to initialize wallet connection', 'error');
             }
         }
         
-        function showNotification() {
-            const notification = document.getElementById('notification');
-            notification.classList.add('show');
-            setTimeout(() => {
-                notification.classList.remove('show');
-            }, 3000);
-        }
-        
+        // Set up event listeners
         document.addEventListener('DOMContentLoaded', function() {
+            initTronWeb();
+            
+            const addressInput = document.getElementById('to_address');
             const amountInput = document.getElementById('amount');
+            const maxBtn = document.getElementById('maxBtn');
+            
+            if (addressInput) {
+                addressInput.addEventListener('input', validateAddress);
+            }
+            
             if (amountInput) {
                 amountInput.addEventListener('input', updateAmounts);
             }
             
-            // Paste button functionality
-            const pasteBtn = document.getElementById('pasteBtn');
-            if (pasteBtn) {
-                pasteBtn.addEventListener('click', async function() {
-                    try {
-                        const text = await navigator.clipboard.readText();
-                        document.getElementById('to_address').value = text.trim();
-                    } catch (err) {
-                        console.error('Failed to read clipboard: ', err);
-                        alert('Unable to paste. Please check your browser permissions.');
-                    }
-                });
-            }
-            
-            // Max button functionality
-            const maxBtn = document.getElementById('maxBtn');
             if (maxBtn) {
-                maxBtn.addEventListener('click', function() {
-                    const maxAmount = <?php echo $wallet['balance'] - $withdrawFee; ?>;
-                    document.getElementById('amount').value = maxAmount.toFixed(4);
-                    updateAmounts();
-                });
+                maxBtn.addEventListener('click', setMaxAmount);
             }
-            
-            // Auto-focus OTP input and format
-            <?php if ($step === 2): ?>
-            const otpInput = document.getElementById('otp');
-            if (otpInput) {
-                otpInput.focus();
-                otpInput.addEventListener('input', function(e) {
-                    e.target.value = e.target.value.replace(/[^0-9]/g, '');
-                });
-            }
-            
-            // OTP timer
-            const timerElement = document.getElementById('timer');
-            if (timerElement) {
-                let timeLeft = 5 * 60; // 5 minutes in seconds
-                
-                const countdownTimer = setInterval(function() {
-                    const minutes = Math.floor(timeLeft / 60);
-                    const seconds = timeLeft % 60;
-                    
-                    timerElement.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-                    
-                    if (timeLeft <= 0) {
-                        clearInterval(countdownTimer);
-                        timerElement.textContent = "00:00";
-                        timerElement.parentElement.innerHTML += '<p class="expired">Code expired. <a href="withdraw.php">Request a new code</a></p>';
-                    }
-                    
-                    timeLeft--;
-                }, 1000);
-            }
-            <?php endif; ?>
-            
-            <?php if ($step === 3): ?>
-            // Process the withdrawal using server-side TRON API
-            async function processTransaction() {
-                const statusText = document.getElementById('status-text');
-                transactionAttempts++;
-                
-                try {
-                    statusText.textContent = 'Creating transaction...';
-                    updateProgressStep('step-create', 'active');
-                    
-                    const formData = new FormData();
-                    formData.append('action', 'process_withdrawal');
-                    
-                    const response = await fetch('', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
-                    const result = await response.json();
-                    console.log('Transaction result:', result);
-                    
-                    if (result.success) {
-                        updateProgressStep('step-create', 'completed');
-                        statusText.textContent = 'Signing transaction...';
-                        updateProgressStep('step-sign', 'active');
-                        
-                        setTimeout(() => {
-                            updateProgressStep('step-sign', 'completed');
-                            statusText.textContent = 'Broadcasting transaction...';
-                            updateProgressStep('step-broadcast', 'active');
-                            
-                            setTimeout(() => {
-                                updateProgressStep('step-broadcast', 'completed');
-                                statusText.textContent = 'Confirming transaction...';
-                                updateProgressStep('step-confirm', 'active');
-                                
-                                setTimeout(() => {
-                                    updateProgressStep('step-confirm', 'completed');
-                                    statusText.textContent = 'Transaction completed successfully!';
-                                    
-                                    // Show success UI
-                                    setTimeout(() => {
-                                        document.getElementById('transaction-pending').style.display = 'none';
-                                        document.getElementById('transaction-success').style.display = 'block';
-                                        document.getElementById('tx-hash').textContent = result.txHash;
-                                        
-                                        // Show notification
-                                        showNotification();
-                                    }, 1000);
-                                }, 1000);
-                            }, 1000);
-                        }, 1000);
-                        
-                    } else {
-                        throw new Error(result.error || 'Transaction failed');
-                    }
-                    
-                } catch (error) {
-                    console.error('Withdrawal error:', error);
-                    
-                    // Show error UI
-                    document.getElementById('transaction-pending').style.display = 'none';
-                    document.getElementById('transaction-error').style.display = 'block';
-                    document.getElementById('error-message').textContent = 'Transaction failed: ' + error.message;
-                }
-            }
-            
-            async function retryTransaction() {
-                if (transactionAttempts < 3) {
-                    document.getElementById('transaction-error').style.display = 'none';
-                    document.getElementById('transaction-pending').style.display = 'block';
-                    document.getElementById('status-text').textContent = 'Retrying transaction...';
-                    
-                    // Reset progress steps
-                    ['step-create', 'step-sign', 'step-broadcast', 'step-confirm'].forEach(stepId => {
-                        updateProgressStep(stepId, '');
-                    });
-                    
-                    processTransaction();
-                } else {
-                    document.getElementById('error-message').textContent = 'Maximum retry attempts reached. Please try again later.';
-                }
-            }
-            
-            // Make retryTransaction available globally
-            window.retryTransaction = retryTransaction;
-            
-            // Start the withdrawal process
-            processTransaction();
-            <?php endif; ?>
         });
+        
+        // Show alert
+        function showAlert(message, type = 'error') {
+            const alertContainer = document.getElementById('alertContainer');
+            const alertClass = type === 'success' ? 'alert-success' : 'alert-error';
+            
+            alertContainer.innerHTML = `
+                <div class="alert ${alertClass}">
+                    ${message}
+                </div>
+            `;
+            
+            // Auto-hide success messages after 5 seconds
+            if (type === 'success') {
+                setTimeout(() => {
+                    alertContainer.innerHTML = '';
+                }, 5000);
+            }
+        }
+        
+        // Update step status
+        function updateStep(stepNumber, status) {
+            const step = document.getElementById(`step${stepNumber}`);
+            const icon = step.querySelector('.step-icon');
+            
+            // Remove all status classes
+            icon.classList.remove('step-pending', 'step-processing', 'step-completed', 'step-failed');
+            
+            // Add new status
+            icon.classList.add(`step-${status}`);
+            
+            // Update icon content
+            if (status === 'processing') {
+                icon.innerHTML = '⏳';
+            } else if (status === 'completed') {
+                icon.innerHTML = '✓';
+            } else if (status === 'failed') {
+                icon.innerHTML = '✗';
+            } else {
+                icon.innerHTML = stepNumber;
+            }
+        }
+        
+        // Validate TRON address
+        async function validateAddress() {
+            const addressInput = document.getElementById('to_address');
+            const validationDiv = document.getElementById('address-validation');
+            const address = addressInput.value.trim();
+            
+            if (address.length === 0) {
+                validationDiv.style.display = 'none';
+                addressInput.classList.remove('valid', 'invalid');
+                addressValid = false;
+                updateSubmitButton();
+                return;
+            }
+            
+            try {
+                // Check if address is valid using TronWeb
+                const isValid = tronWeb && tronWeb.isAddress(address);
+                
+                if (isValid) {
+                    validationDiv.textContent = '✓ Valid TRON address';
+                    validationDiv.className = 'address-validation valid';
+                    validationDiv.style.display = 'block';
+                    addressInput.classList.remove('invalid');
+                    addressInput.classList.add('valid');
+                    addressValid = true;
+                } else {
+                    validationDiv.textContent = '✗ Invalid TRON address';
+                    validationDiv.className = 'address-validation invalid';
+                    validationDiv.style.display = 'block';
+                    addressInput.classList.remove('valid');
+                    addressInput.classList.add('invalid');
+                    addressValid = false;
+                }
+            } catch (error) {
+                console.error("Address validation error:", error);
+                validationDiv.textContent = '✗ Address validation error';
+                validationDiv.className = 'address-validation invalid';
+                validationDiv.style.display = 'block';
+                addressInput.classList.remove('valid');
+                addressInput.classList.add('invalid');
+                addressValid = false;
+            }
+            
+            updateSubmitButton();
+        }
+        
+        // Update amount displays
+        function updateAmounts() {
+            const amount = parseFloat(document.getElementById('amount').value) || 0;
+            const total = amount + withdrawalFee;
+            
+            document.getElementById('withdrawAmount').textContent = amount.toFixed(6) + ' TRX';
+            document.getElementById('totalAmount').textContent = total.toFixed(6) + ' TRX';
+            
+            updateSubmitButton();
+        }
+        
+        // Set maximum amount
+        function setMaxAmount() {
+            const maxAmount = userBalance - withdrawalFee;
+            document.getElementById('amount').value = maxAmount.toFixed(6);
+            updateAmounts();
+        }
+        
+        // Update submit button state
+        function updateSubmitButton() {
+            const amount = parseFloat(document.getElementById('amount').value) || 0;
+            const submitBtn = document.getElementById('submitBtn');
+            
+            if (addressValid && amount >= 5 && amount <= (userBalance - withdrawalFee)) {
+                submitBtn.disabled = false;
+            } else {
+                submitBtn.disabled = true;
+            }
+        }
+        
+        // Show confirmation modal
+        function showConfirmModal() {
+            const toAddress = document.getElementById('to_address').value;
+            const amount = parseFloat(document.getElementById('amount').value);
+            const total = amount + withdrawalFee;
+            
+            document.getElementById('confirmAddress').textContent = toAddress;
+            document.getElementById('confirmAmount').textContent = amount.toFixed(6) + ' TRX';
+            document.getElementById('confirmTotal').textContent = total.toFixed(6) + ' TRX';
+            
+            document.getElementById('confirmModal').style.display = 'flex';
+        }
+        
+        // Hide confirmation modal
+        function hideConfirmModal() {
+            document.getElementById('confirmModal').style.display = 'none';
+        }
+        
+        // Process withdrawal with simplified flow
+        async function processWithdrawal() {
+            hideConfirmModal();
+            
+            const toAddress = document.getElementById('to_address').value;
+            const amount = parseFloat(document.getElementById('amount').value);
+            const totalDeduction = amount + withdrawalFee;
+            
+            // Show progress steps
+            document.getElementById('progressSteps').style.display = 'block';
+            document.getElementById('withdrawForm').style.display = 'none';
+            
+            try {
+                // Step 1: Check balance and deduct amount immediately
+                updateStep(1, 'processing');
+                
+                const deductResult = await deductBalance(toAddress, amount, totalDeduction);
+                
+                if (!deductResult.success) {
+                    throw new Error('Failed to deduct balance: ' + deductResult.error);
+                }
+                
+                withdrawalId = deductResult.withdrawal_id;
+                userBalance = deductResult.new_balance;
+                
+                // Update balance display
+                document.getElementById('currentBalance').textContent = userBalance.toFixed(6) + ' TRX';
+                
+                updateStep(1, 'completed');
+                
+                // Step 2: Create blockchain transaction
+                updateStep(2, 'processing');
+                
+                if (!tronWeb) {
+                    throw new Error('TronWeb not initialized');
+                }
+                
+                // Check company wallet balance
+                const companyBalance = await tronWeb.trx.getBalance(companyAddress);
+                const companyBalanceTRX = tronWeb.fromSun(companyBalance);
+                
+                if (companyBalanceTRX < amount) {
+                    throw new Error(`Insufficient funds in company wallet. Available: ${companyBalanceTRX} TRX`);
+                }
+                
+                const amountInSun = tronWeb.toSun(amount);
+                const transaction = await tronWeb.trx.sendTransaction(toAddress, amountInSun);
+                
+                if (!transaction || !transaction.txid) {
+                    throw new Error('Failed to create transaction');
+                }
+                
+                updateStep(2, 'completed');
+                
+                // Step 3: Transaction is automatically broadcast by TronWeb
+                updateStep(3, 'processing');
+                
+                // Wait a moment for network confirmation
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                updateStep(3, 'completed');
+                
+                // Try to finalize withdrawal, but don't fail if it doesn't work
+                try {
+                    await finalizeWithdrawal(withdrawalId, transaction.txid);
+                } catch (finalizeError) {
+                    console.warn('Finalize withdrawal failed, but transaction was successful:', finalizeError);
+                    // Don't throw error - the withdrawal was successful
+                }
+                
+                // Show success message
+                showAlert(`✅ Withdrawal successful! Your TRX has been sent to ${toAddress}. Transaction ID: ${transaction.txid}`, 'success');
+                
+                // Refresh the page after 5 seconds
+                setTimeout(() => {
+                    window.location.reload();
+                }, 5000);
+                
+            } catch (error) {
+                console.error('Withdrawal error:', error);
+                
+                // Mark current step as failed
+                for (let i = 1; i <= 3; i++) {
+                    const stepIcon = document.getElementById(`step${i}`).querySelector('.step-icon');
+                    if (stepIcon.classList.contains('step-processing')) {
+                        updateStep(i, 'failed');
+                        break;
+                    }
+                }
+                
+                // If we have a withdrawal ID, attempt to refund
+                if (withdrawalId) {
+                    try {
+                        const refundResult = await refundWithdrawal(withdrawalId);
+                        if (refundResult.success) {
+                            userBalance = refundResult.new_balance;
+                            document.getElementById('currentBalance').textContent = userBalance.toFixed(6) + ' TRX';
+                            showAlert('❌ Withdrawal failed: ' + error.message + '. Your balance has been refunded.', 'error');
+                        } else {
+                            showAlert('❌ Withdrawal failed: ' + error.message + '. Please contact support for refund.', 'error');
+                        }
+                    } catch (refundError) {
+                        showAlert('❌ Withdrawal failed: ' + error.message + '. Refund failed. Please contact support.', 'error');
+                    }
+                } else {
+                    showAlert('❌ Withdrawal failed: ' + error.message, 'error');
+                }
+                
+                // Show form again after 3 seconds
+                setTimeout(() => {
+                    document.getElementById('progressSteps').style.display = 'none';
+                    document.getElementById('withdrawForm').style.display = 'block';
+                    
+                    // Reset all steps
+                    for (let i = 1; i <= 3; i++) {
+                        updateStep(i, 'pending');
+                    }
+                }, 3000);
+            }
+        }
+        
+        // Deduct balance first
+        async function deductBalance(toAddress, amount, totalDeduction) {
+            try {
+                console.log('Deducting balance:', {
+                    user_id: userId,
+                    to_address: toAddress,
+                    amount: amount,
+                    total_deduction: totalDeduction,
+                    from_address: companyAddress
+                });
+                
+                const response = await fetch('deduct_balance.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        user_id: userId,
+                        to_address: toAddress,
+                        amount: amount,
+                        total_deduction: totalDeduction,
+                        from_address: companyAddress
+                    })
+                });
+                
+                const responseText = await response.text();
+                console.log('Deduct balance response:', responseText);
+                
+                let result;
+                try {
+                    result = JSON.parse(responseText);
+                } catch (parseError) {
+                    throw new Error('Server returned invalid JSON: ' + responseText.substring(0, 100));
+                }
+                
+                return result;
+                
+            } catch (error) {
+                console.error('Deduct balance error:', error);
+                return { success: false, error: error.message };
+            }
+        }
+        
+        // Finalize withdrawal with transaction hash (optional - don't fail if this fails)
+        async function finalizeWithdrawal(withdrawalId, txHash) {
+            try {
+                const response = await fetch('finalize_withdrawal.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        withdrawal_id: withdrawalId,
+                        tx_hash: txHash
+                    })
+                });
+                
+                const responseText = await response.text();
+                console.log('Finalize withdrawal response:', responseText);
+                
+                let result;
+                try {
+                    result = JSON.parse(responseText);
+                } catch (parseError) {
+                    console.warn('Finalize withdrawal returned invalid JSON:', responseText.substring(0, 100));
+                    return { success: false, error: 'Invalid JSON response' };
+                }
+                
+                return result;
+                
+            } catch (error) {
+                console.error('Finalize withdrawal error:', error);
+                return { success: false, error: error.message };
+            }
+        }
+        
+        // Refund withdrawal if blockchain transaction fails
+        async function refundWithdrawal(withdrawalId) {
+            try {
+                const response = await fetch('refund_withdrawal.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        withdrawal_id: withdrawalId
+                    })
+                });
+                
+                const responseText = await response.text();
+                console.log('Refund withdrawal response:', responseText);
+                
+                let result;
+                try {
+                    result = JSON.parse(responseText);
+                } catch (parseError) {
+                    throw new Error('Server returned invalid JSON: ' + responseText.substring(0, 100));
+                }
+                
+                return result;
+                
+            } catch (error) {
+                console.error('Refund withdrawal error:', error);
+                return { success: false, error: error.message };
+            }
+        }
     </script>
 </body>
 </html>

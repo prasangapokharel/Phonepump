@@ -28,7 +28,7 @@
 </div>
 
 <style>
-    /* Global styles for all pages */
+    /* Global styles for app container */
     * {
         margin: 0;
         padding: 0;
@@ -56,40 +56,50 @@
         background: transparent; /* Chrome/Safari/Webkit */
     }
     
-    /* Ensure all containers have proper spacing for bottom nav */
+    /* App container with proper constraints */
     .app {
         min-height: 100vh;
+        max-width: 430px; /* iPhone 14 Pro Max width */
+        margin: 0 auto;
         background: #000;
-        padding-bottom: 100px; /* Increased from 80px to 100px */
+        padding-bottom: 85px;
         position: relative;
+        border-left: 1px solid #222;
+        border-right: 1px solid #222;
     }
     
-    /* Main content containers */
+    /* Main content containers with app-friendly sizing */
     .assets-container,
     .trade-container,
-    .launch-container {
-        max-width: 600px;
-        margin: 0 auto;
-        padding: 16px;
-        padding-bottom: 40px; /* Increased from 20px to 40px */
+    .launch-container,
+    .dashboard-container {
+        width: 100%;
+        max-width: 100%;
+        margin: 0;
+        padding: 16px 20px;
+        padding-bottom: 30px;
     }
     
-    /* Bottom Navigation */
+    /* Bottom Navigation - App-friendly design */
     .bottom-nav {
         position: fixed;
         bottom: 0;
-        left: 0;
-        right: 0;
-        background: #111;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 100%;
+        max-width: 430px; /* Match app container */
+        background: rgba(17, 17, 17, 0.95);
         display: flex;
         justify-content: space-around;
         align-items: center;
-        padding: 12px 0 8px 0;
+        padding: 8px 16px 12px 16px;
         border-top: 1px solid #333;
         z-index: 1000;
         height: 70px;
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border-left: 1px solid #222;
+        border-right: 1px solid #222;
     }
     
     .nav-btn {
@@ -99,40 +109,61 @@
         justify-content: center;
         color: #666;
         text-decoration: none;
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 500;
-        padding: 4px 8px;
-        width: 25%;
+        padding: 6px 12px;
+        flex: 1;
         transition: all 0.2s ease;
-        border-radius: 8px;
+        border-radius: 12px;
+        position: relative;
+        min-height: 50px;
     }
     
+    /* Removed active background - only color change */
     .nav-btn.active {
         color: #fff;
-        background: rgba(255, 255, 255, 0.1);
     }
     
     .nav-btn:hover {
         color: #ccc;
     }
     
+    /* Active indicator dot instead of background */
+    .nav-btn.active::after {
+        content: '';
+        position: absolute;
+        bottom: 2px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 4px;
+        height: 4px;
+        background: #fff;
+        border-radius: 50%;
+    }
+    
     .nav-icon {
-        width: 24px;
-        height: 24px;
+        width: 22px;
+        height: 22px;
         margin-bottom: 4px;
         stroke-width: 1.5;
+        transition: all 0.2s ease;
+    }
+    
+    .nav-btn.active .nav-icon {
+        stroke-width: 2;
     }
     
     .nav-btn span {
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 500;
-        letter-spacing: 0.3px;
+        letter-spacing: 0.2px;
+        text-align: center;
     }
     
-    /* Header styles */
+    /* Header styles for app */
     .header {
-        background: #111;
-        padding: 16px 20px;
+        background: rgba(17, 17, 17, 0.95);
+        padding: 12px 20px;
         border-bottom: 1px solid #333;
         display: flex;
         justify-content: space-between;
@@ -140,12 +171,12 @@
         position: sticky;
         top: 0;
         z-index: 100;
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
     }
     
     .logo {
-        font-size: 20px;
+        font-size: 18px;
         font-weight: 600;
         color: #fff;
     }
@@ -157,70 +188,124 @@
         border: none;
         font-weight: 500;
         text-decoration: none;
-        font-size: 14px;
-        border-radius: 6px;
+        font-size: 13px;
+        border-radius: 8px;
         transition: all 0.2s ease;
     }
     
     .action-btn:hover {
         background: #f0f0f0;
+        transform: scale(0.98);
     }
     
-    /* Responsive design */
-    @media (max-width: 480px) {
-        .assets-container,
-        .trade-container,
-        .launch-container {
-            padding: 12px;
-            padding-bottom: 50px; /* Increased for mobile */
-        }
-        
-        .header {
-            padding: 12px 16px;
-        }
-        
-        .logo {
-            font-size: 18px;
-        }
-        
-        .action-btn {
-            padding: 6px 12px;
-            font-size: 13px;
+    /* Mobile-first responsive design */
+    @media (max-width: 430px) {
+        .app {
+            max-width: 100vw;
+            border-left: none;
+            border-right: none;
         }
         
         .bottom-nav {
-            height: 65px;
-            padding: 8px 0 6px 0;
+            max-width: 100vw;
+            border-left: none;
+            border-right: none;
+            padding: 6px 12px 10px 12px;
         }
         
-        .app {
-            padding-bottom: 110px; /* Increased for mobile */
+        .assets-container,
+        .trade-container,
+        .launch-container,
+        .dashboard-container {
+            padding: 12px 16px;
+            padding-bottom: 25px;
+        }
+        
+        .nav-btn {
+            padding: 4px 8px;
+            min-height: 48px;
         }
         
         .nav-icon {
-            width: 22px;
-            height: 22px;
+            width: 20px;
+            height: 20px;
             margin-bottom: 3px;
         }
         
         .nav-btn span {
-            font-size: 10px;
-        }
-        
-        .nav-btn {
-            padding: 3px 6px;
+            font-size: 9px;
         }
     }
     
-    @media (max-width: 360px) {
+    @media (max-width: 375px) {
         .app {
-            padding-bottom: 120px; /* Even more space for smaller screens */
+            padding-bottom: 80px;
         }
         
         .assets-container,
         .trade-container,
-        .launch-container {
-            padding-bottom: 60px;
+        .launch-container,
+        .dashboard-container {
+            padding: 10px 14px;
+            padding-bottom: 20px;
+        }
+        
+        .bottom-nav {
+            height: 65px;
+            padding: 4px 8px 8px 8px;
+        }
+        
+        .nav-btn {
+            padding: 3px 6px;
+            min-height: 45px;
+        }
+        
+        .nav-icon {
+            width: 18px;
+            height: 18px;
+            margin-bottom: 2px;
+        }
+        
+        .nav-btn span {
+            font-size: 8px;
+        }
+        
+        .header {
+            padding: 10px 16px;
+        }
+        
+        .logo {
+            font-size: 16px;
+        }
+        
+        .action-btn {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+    }
+    
+    /* Landscape orientation adjustments */
+    @media (orientation: landscape) and (max-height: 500px) {
+        .bottom-nav {
+            height: 55px;
+            padding: 4px 16px 6px 16px;
+        }
+        
+        .nav-btn {
+            min-height: 40px;
+        }
+        
+        .nav-icon {
+            width: 18px;
+            height: 18px;
+        }
+        
+        .nav-btn span {
+            font-size: 8px;
+        }
+        
+        .app {
+            padding-bottom: 65px;
         }
     }
     
@@ -239,65 +324,113 @@
     .token-grid,
     .token-list,
     .transactions-list {
-        margin-bottom: 20px;
+        margin-bottom: 15px;
     }
     
     /* Safe area for devices with notches */
     @supports (padding-bottom: env(safe-area-inset-bottom)) {
         .bottom-nav {
-            padding-bottom: calc(8px + env(safe-area-inset-bottom));
+            padding-bottom: calc(12px + env(safe-area-inset-bottom));
         }
         
         .app {
-            padding-bottom: calc(100px + env(safe-area-inset-bottom));
+            padding-bottom: calc(85px + env(safe-area-inset-bottom));
         }
     }
     
-    /* Loading states and animations */
+    /* Touch optimizations */
     .nav-btn {
         -webkit-tap-highlight-color: transparent;
         user-select: none;
+        touch-action: manipulation;
     }
     
     /* Focus states for accessibility */
     .nav-btn:focus {
-        outline: 2px solid #fff;
+        outline: 2px solid rgba(255, 255, 255, 0.5);
         outline-offset: 2px;
+    }
+    
+    /* Loading states */
+    .nav-btn.loading {
+        opacity: 0.6;
+        pointer-events: none;
+    }
+    
+    /* Prevent content overflow */
+    .app > * {
+        max-width: 100%;
+        overflow-x: hidden;
+    }
+    
+    /* Ensure proper spacing for different content types */
+    .content-wrapper {
+        padding-bottom: 20px;
     }
     
     /* Dark theme optimizations */
     @media (prefers-color-scheme: dark) {
         .bottom-nav {
-            background: #111;
+            background: rgba(17, 17, 17, 0.98);
             border-top-color: #333;
+        }
+        
+        .app {
+            background: #000;
+        }
+    }
+    
+    /* High contrast mode support */
+    @media (prefers-contrast: high) {
+        .nav-btn.active {
+            color: #fff;
+            font-weight: 600;
+        }
+        
+        .nav-btn.active::after {
+            width: 6px;
+            height: 6px;
+        }
+    }
+    
+    /* Reduced motion support */
+    @media (prefers-reduced-motion: reduce) {
+        .nav-btn,
+        .nav-icon,
+        .action-btn {
+            transition: none;
+        }
+        
+        html {
+            scroll-behavior: auto;
         }
     }
 </style>
 
 <script>
-// Add smooth navigation transitions
+// Enhanced navigation with app-friendly features
 document.addEventListener('DOMContentLoaded', function() {
-    // Add active state management
     const navBtns = document.querySelectorAll('.nav-btn');
     
+    // Add smooth navigation transitions
     navBtns.forEach(btn => {
         btn.addEventListener('click', function(e) {
             // Add loading state
-            this.style.opacity = '0.7';
+            this.classList.add('loading');
             
             // Reset after navigation
             setTimeout(() => {
-                this.style.opacity = '1';
-            }, 200);
+                this.classList.remove('loading');
+            }, 300);
         });
     });
     
     // Handle back button navigation
     window.addEventListener('popstate', function() {
-        // Update active states based on current URL
         updateActiveNav();
     });
     
+    // Update active navigation state
     function updateActiveNav() {
         const currentPath = window.location.pathname;
         navBtns.forEach(btn => {
@@ -309,24 +442,90 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     }
+    
+    // Prevent scroll bounce on iOS
+    document.addEventListener('touchmove', function(e) {
+        if (e.target.closest('.bottom-nav')) {
+            e.preventDefault();
+        }
+    }, { passive: false });
+    
+    // Add haptic feedback for supported devices
+    function addHapticFeedback() {
+        if ('vibrate' in navigator) {
+            navigator.vibrate(10);
+        }
+    }
+    
+    // Add haptic feedback to nav button clicks
+    navBtns.forEach(btn => {
+        btn.addEventListener('click', addHapticFeedback);
+    });
+    
+    // Handle orientation changes
+    window.addEventListener('orientationchange', function() {
+        setTimeout(() => {
+            // Recalculate layout after orientation change
+            window.scrollTo(0, window.scrollY);
+        }, 100);
+    });
+    
+    // Optimize for app-like behavior
+    let lastScrollTop = 0;
+    const bottomNav = document.querySelector('.bottom-nav');
+    
+    // Optional: Hide nav on scroll down, show on scroll up (uncomment if needed)
+    /*
+    window.addEventListener('scroll', function() {
+        const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+        
+        if (scrollTop > lastScrollTop && scrollTop > 100) {
+            // Scrolling down
+            bottomNav.style.transform = 'translateX(-50%) translateY(100%)';
+        } else {
+            // Scrolling up
+            bottomNav.style.transform = 'translateX(-50%) translateY(0)';
+        }
+        
+        lastScrollTop = scrollTop;
+    }, { passive: true });
+    */
+    
+    // Ensure proper app container sizing
+    function adjustAppContainer() {
+        const app = document.querySelector('.app');
+        if (app) {
+            const viewportWidth = window.innerWidth;
+            if (viewportWidth > 430) {
+                app.style.maxWidth = '430px';
+                app.style.margin = '0 auto';
+            } else {
+                app.style.maxWidth = '100vw';
+                app.style.margin = '0';
+            }
+        }
+    }
+    
+    // Adjust on load and resize
+    adjustAppContainer();
+    window.addEventListener('resize', adjustAppContainer);
+    
+    // Prevent zoom on double tap
+    let lastTouchEnd = 0;
+    document.addEventListener('touchend', function(event) {
+        const now = (new Date()).getTime();
+        if (now - lastTouchEnd <= 300) {
+            event.preventDefault();
+        }
+        lastTouchEnd = now;
+    }, false);
 });
 
-// Prevent scroll bounce on iOS
-document.addEventListener('touchmove', function(e) {
-    if (e.target.closest('.bottom-nav')) {
-        e.preventDefault();
-    }
-}, { passive: false });
-
-// Add haptic feedback for supported devices
-function addHapticFeedback() {
-    if ('vibrate' in navigator) {
-        navigator.vibrate(10);
-    }
+// Service Worker registration for app-like behavior (optional)
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function() {
+        // Uncomment if you have a service worker
+        // navigator.serviceWorker.register('/sw.js');
+    });
 }
-
-// Add to nav button clicks
-document.querySelectorAll('.nav-btn').forEach(btn => {
-    btn.addEventListener('click', addHapticFeedback);
-});
 </script>

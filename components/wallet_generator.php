@@ -1,55 +1,39 @@
 <?php
-// TRON Wallet Generator - Completely self-contained
-// No external dependencies required
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use Elliptic\EC;
+use kornrunner\Keccak;
 
 class TronWalletGenerator {
     
-    public static function generateWallet(): array {
+    /**
+     * Generate a new TRON wallet
+     * @return array
+     */
+    public static function generateWallet() {
         try {
             // Generate private key (32 bytes)
-            $privateKeyBytes = random_bytes(32);
-            $privateKeyHex = bin2hex($privateKeyBytes);
+            $privateKey = bin2hex(random_bytes(32));
             
-            // Generate public key
-            $publicKeyHex = self::generatePublicKey($privateKeyHex);
+            // Generate address from private key
+            $address = self::privateKeyToAddress($privateKey);
             
-            // Generate TRON address
-            $address = self::generateTronAddress($publicKeyHex);
-            
-            return [
-                'success' => true,
-                'address' => $address,
-                'private_key' => $privateKeyHex,
-                'public_key' => $publicKeyHex,
-                'mnemonic' => self::generateMnemonic()
-            ];
-        } catch (Exception $e) {
-            return [
-                'success' => false,
-                'error' => $e->getMessage()
-            ];
-        }
-    }
-    
-    public static function generateFromPrivateKey(string $privateKeyHex): array {
-        try {
-            // Validate private key
-            if (strlen($privateKeyHex) !== 64 || !ctype_xdigit($privateKeyHex)) {
-                throw new InvalidArgumentException('Invalid private key format');
+            if (!$address) {
+                throw new Exception("Failed to generate address from private key");
             }
             
-            // Generate public key
-            $publicKeyHex = self::generatePublicKey($privateKeyHex);
-            
-            // Generate TRON address
-            $address = self::generateTronAddress($publicKeyHex);
+            // Verify the generated address
+            if (!self::isValidTronAddress($address)) {
+                throw new Exception("Generated invalid TRON address");
+            }
             
             return [
                 'success' => true,
+                'private_key' => $privateKey,
                 'address' => $address,
-                'private_key' => $privateKeyHex,
-                'public_key' => $publicKeyHex
+                'public_key' => self::privateKeyToPublicKey($privateKey)
             ];
+            
         } catch (Exception $e) {
             return [
                 'success' => false,
@@ -58,210 +42,388 @@ class TronWalletGenerator {
         }
     }
     
-    private static function generatePublicKey(string $privateKeyHex): string {
-        // Simplified public key generation for TRON
-        // In production, this would use proper secp256k1 elliptic curve
-        $hash1 = hash('sha256', hex2bin($privateKeyHex));
-        $hash2 = hash('sha256', $hash1);
-        
-        // Create uncompressed public key (04 + 64 bytes)
-        return '04' . $hash2 . hash('sha256', $hash2);
-    }
-    
-    private static function generateTronAddress(string $publicKeyHex): string {
-        // Remove '04' prefix for uncompressed key
-        $publicKeyBytes = hex2bin(substr($publicKeyHex, 2));
-        
-        // Use SHA3-256 (Keccak) hash - fallback to SHA256 if not available
-        $hash = self::keccakHash($publicKeyBytes);
-        
-        // Take last 20 bytes and add TRON prefix (0x41)
-        $addressHex = "41" . substr(bin2hex($hash), -40);
-        
-        // Create address with checksum
-        return self::base58CheckEncode(hex2bin($addressHex));
-    }
-    
-    private static function keccakHash(string $data): string {
-        // Try to use SHA3-256 if available
-        if (function_exists('hash') && in_array('sha3-256', hash_algos())) {
-            return hash('sha3-256', $data, true);
+    /**
+     * Convert private key to TRON address
+     * @param string $privateKeyHex
+     * @return string|false
+     */
+    public static function privateKeyToAddress($privateKeyHex) {
+        try {
+            // Create elliptic curve instance
+            $ec = new EC('secp256k1');
+            
+            // Get key pair from private key
+            $keyPair = $ec->keyFromPrivate($privateKeyHex, 'hex');
+            
+            // Get public key (uncompressed, without 0x04 prefix)
+            $publicKey = $keyPair->getPublic('hex');
+            
+            // Remove 0x04 prefix if present
+            if (substr($publicKey, 0, 2) === '04') {
+                $publicKey = substr($publicKey, 2);
+            }
+            
+            // Convert public key to binary
+            $publicKeyBin = hex2bin($publicKey);
+            
+            // Get Keccak-256 hash of public key
+            $hash = Keccak::hash($publicKeyBin, 256);
+            
+            // Take last 20 bytes of the hash
+            $addressBytes = substr($hash, -20);
+            
+            // Add TRON prefix (0x41)
+            $addressWithPrefix = "\x41" . $addressBytes;
+            
+            // Calculate checksum (double SHA256)
+            $checksum = hash('sha256', hash('sha256', $addressWithPrefix, true), true);
+            
+            // Take first 4 bytes of checksum
+            $checksumBytes = substr($checksum, 0, 4);
+            
+            // Combine address with checksum
+            $fullAddress = $addressWithPrefix . $checksumBytes;
+            
+            // Encode in Base58
+            $address = self::base58Encode($fullAddress);
+            
+            return $address;
+            
+        } catch (Exception $e) {
+            error_log("Error converting private key to address: " . $e->getMessage());
+            return false;
         }
-        
-        // Fallback to SHA256 (not ideal but works for testing)
-        return hash('sha256', $data, true);
     }
     
-    private static function base58CheckEncode(string $data): string {
-        // Add checksum
-        $hash = hash('sha256', hash('sha256', $data, true), true);
-        $checksum = substr($hash, 0, 4);
-        $dataWithChecksum = $data . $checksum;
-        
-        // Base58 encode
-        return self::base58Encode($dataWithChecksum);
+    /**
+     * Get public key from private key
+     * @param string $privateKeyHex
+     * @return string|false
+     */
+    public static function privateKeyToPublicKey($privateKeyHex) {
+        try {
+            $ec = new EC('secp256k1');
+            $keyPair = $ec->keyFromPrivate($privateKeyHex, 'hex');
+            return $keyPair->getPublic('hex');
+        } catch (Exception $e) {
+            return false;
+        }
     }
     
-    private static function base58Encode(string $data): string {
+    /**
+     * Base58 encoding without GMP dependency
+     * @param string $data
+     * @return string
+     */
+    private static function base58Encode($data) {
         $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+        $base = 58;
         
-        if (strlen($data) === 0) {
-            return '';
-        }
-        
-        // Skip GMP check since we know it's not available
-        // Go directly to BCMath or fallback
-        if (function_exists('bcadd')) {
-            return self::base58EncodeBCMath($data, $alphabet);
-        } else {
-            // Fallback for systems without bcmath or gmp
-            return self::base58EncodeFallback($data, $alphabet);
-        }
-    }
-    
-    private static function base58EncodeBCMath(string $data, string $alphabet): string {
+        // Convert binary data to hex string for easier manipulation
         $hex = bin2hex($data);
-        $num = '0';
         
-        // Convert hex to decimal using bcmath
-        for ($i = 0; $i < strlen($hex); $i++) {
-            $num = bcadd(bcmul($num, '16'), hexdec($hex[$i]));
-        }
-        
-        $encoded = '';
-        while (bccomp($num, '0') > 0) {
-            $remainder = bcmod($num, '58');
-            $encoded = $alphabet[intval($remainder)] . $encoded;
-            $num = bcdiv($num, '58');
+        // Use BCMath if available, otherwise use pure PHP
+        if (extension_loaded('bcmath')) {
+            $num = self::hexToBcmath($hex);
+            
+            $encoded = '';
+            while (bccomp($num, '0') > 0) {
+                $remainder = bcmod($num, $base);
+                $encoded = $alphabet[intval($remainder)] . $encoded;
+                $num = bcdiv($num, $base, 0);
+            }
+        } else {
+            // Pure PHP implementation for smaller numbers
+            $bytes = array_values(unpack('C*', $data));
+            $num = '0';
+            
+            // Convert bytes to decimal string
+            foreach ($bytes as $byte) {
+                $num = self::addStrings(self::multiplyStrings($num, '256'), strval($byte));
+            }
+            
+            $encoded = '';
+            while (self::compareStrings($num, '0') > 0) {
+                $remainder = self::modString($num, strval($base));
+                $encoded = $alphabet[intval($remainder)] . $encoded;
+                $num = self::divideString($num, strval($base));
+            }
         }
         
         // Add leading zeros
         for ($i = 0; $i < strlen($data) && $data[$i] === "\x00"; $i++) {
-            $encoded = '1' . $encoded;
+            $encoded = $alphabet[0] . $encoded;
         }
         
         return $encoded;
     }
     
-    private static function base58EncodeFallback(string $data, string $alphabet): string {
-        // Simple fallback that creates a valid-looking TRON address
-        $hash = hash('sha256', $data);
-        $encoded = 'T';
+    /**
+     * Base58 decoding without GMP dependency
+     * @param string $encoded
+     * @return string
+     */
+    public static function base58Decode($encoded) {
+        $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+        $base = 58;
         
-        // Use parts of the hash to create a 33-character string
-        for ($i = 0; $i < 33; $i++) {
-            $index = hexdec(substr($hash, $i % 64, 1)) % 58;
-            $encoded .= $alphabet[$index];
+        if (extension_loaded('bcmath')) {
+            $num = '0';
+            for ($i = 0; $i < strlen($encoded); $i++) {
+                $char = $encoded[$i];
+                $pos = strpos($alphabet, $char);
+                if ($pos === false) {
+                    throw new Exception("Invalid character in Base58 string");
+                }
+                $num = bcadd(bcmul($num, $base), $pos);
+            }
+            
+            $hex = self::bcmathToHex($num);
+        } else {
+            // Pure PHP implementation
+            $num = '0';
+            for ($i = 0; $i < strlen($encoded); $i++) {
+                $char = $encoded[$i];
+                $pos = strpos($alphabet, $char);
+                if ($pos === false) {
+                    throw new Exception("Invalid character in Base58 string");
+                }
+                $num = self::addStrings(self::multiplyStrings($num, strval($base)), strval($pos));
+            }
+            
+            $hex = self::decimalToHex($num);
         }
         
-        return $encoded;
+        if (strlen($hex) % 2 !== 0) {
+            $hex = '0' . $hex;
+        }
+        
+        $decoded = hex2bin($hex);
+        
+        // Add leading zeros
+        for ($i = 0; $i < strlen($encoded) && $encoded[$i] === $alphabet[0]; $i++) {
+            $decoded = "\x00" . $decoded;
+        }
+        
+        return $decoded;
     }
     
-    private static function generateMnemonic(): string {
-        // BIP39 word list (simplified)
-        $words = [
-            'abandon', 'ability', 'able', 'about', 'above', 'absent', 'absorb', 'abstract',
-            'absurd', 'abuse', 'access', 'accident', 'account', 'accuse', 'achieve', 'acid',
-            'acoustic', 'acquire', 'across', 'act', 'action', 'actor', 'actress', 'actual',
-            'adapt', 'add', 'addict', 'address', 'adjust', 'admit', 'adult', 'advance',
-            'advice', 'aerobic', 'affair', 'afford', 'afraid', 'again', 'against', 'age',
-            'agent', 'agree', 'ahead', 'aim', 'air', 'airport', 'aisle', 'alarm',
-            'album', 'alcohol', 'alert', 'alien', 'all', 'alley', 'allow', 'almost',
-            'alone', 'alpha', 'already', 'also', 'alter', 'always', 'amateur', 'amazing',
-            'among', 'amount', 'amused', 'analyst', 'anchor', 'ancient', 'anger', 'angle',
-            'angry', 'animal', 'ankle', 'announce', 'annual', 'another', 'answer', 'antenna',
-            'antique', 'anxiety', 'any', 'apart', 'apology', 'appear', 'apple', 'approve',
-            'april', 'arch', 'arctic', 'area', 'arena', 'argue', 'arm', 'armed',
-            'armor', 'army', 'around', 'arrange', 'arrest', 'arrive', 'arrow', 'art',
-            'artefact', 'artist', 'artwork', 'ask', 'aspect', 'assault', 'asset', 'assist',
-            'assume', 'asthma', 'athlete', 'atom', 'attack', 'attend', 'attitude', 'attract',
-            'auction', 'audit', 'august', 'aunt', 'author', 'auto', 'autumn', 'average'
-        ];
-        
-        $mnemonic = [];
-        for ($i = 0; $i < 12; $i++) {
-            $mnemonic[] = $words[array_rand($words)];
+    /**
+     * Convert hex to BCMath number
+     */
+    private static function hexToBcmath($hex) {
+        $num = '0';
+        for ($i = 0; $i < strlen($hex); $i++) {
+            $digit = hexdec($hex[$i]);
+            $num = bcadd(bcmul($num, '16'), $digit);
         }
-        
-        return implode(' ', $mnemonic);
+        return $num;
     }
     
-    public static function validateAddress(string $address): bool {
-        // Basic TRON address validation
-        if (strlen($address) !== 34) {
-            return false;
+    /**
+     * Convert BCMath number to hex
+     */
+    private static function bcmathToHex($num) {
+        $hex = '';
+        while (bccomp($num, '0') > 0) {
+            $remainder = bcmod($num, '16');
+            $hex = dechex(intval($remainder)) . $hex;
+            $num = bcdiv($num, '16', 0);
+        }
+        return $hex ?: '0';
+    }
+    
+    /**
+     * Pure PHP string arithmetic functions
+     */
+    private static function addStrings($a, $b) {
+        $result = '';
+        $carry = 0;
+        $i = strlen($a) - 1;
+        $j = strlen($b) - 1;
+        
+        while ($i >= 0 || $j >= 0 || $carry > 0) {
+            $sum = $carry;
+            if ($i >= 0) $sum += intval($a[$i--]);
+            if ($j >= 0) $sum += intval($b[$j--]);
+            
+            $result = ($sum % 10) . $result;
+            $carry = intval($sum / 10);
         }
         
-        if (substr($address, 0, 1) !== 'T') {
-            return false;
+        return $result;
+    }
+    
+    private static function multiplyStrings($a, $b) {
+        if ($a === '0' || $b === '0') return '0';
+        
+        $result = '0';
+        for ($i = strlen($b) - 1; $i >= 0; $i--) {
+            $temp = self::multiplyByDigit($a, intval($b[$i]));
+            $temp .= str_repeat('0', strlen($b) - 1 - $i);
+            $result = self::addStrings($result, $temp);
         }
         
-        // Check if it contains only valid Base58 characters
-        $validChars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-        for ($i = 0; $i < strlen($address); $i++) {
-            if (strpos($validChars, $address[$i]) === false) {
+        return $result;
+    }
+    
+    private static function multiplyByDigit($num, $digit) {
+        if ($digit === 0) return '0';
+        
+        $result = '';
+        $carry = 0;
+        
+        for ($i = strlen($num) - 1; $i >= 0; $i--) {
+            $prod = intval($num[$i]) * $digit + $carry;
+            $result = ($prod % 10) . $result;
+            $carry = intval($prod / 10);
+        }
+        
+        if ($carry > 0) $result = $carry . $result;
+        
+        return $result;
+    }
+    
+    private static function compareStrings($a, $b) {
+        if (strlen($a) > strlen($b)) return 1;
+        if (strlen($a) < strlen($b)) return -1;
+        return strcmp($a, $b);
+    }
+    
+    private static function divideString($a, $b) {
+        if ($b === '0') throw new Exception("Division by zero");
+        if (self::compareStrings($a, $b) < 0) return '0';
+        
+        $result = '';
+        $temp = '';
+        
+        for ($i = 0; $i < strlen($a); $i++) {
+            $temp .= $a[$i];
+            $temp = ltrim($temp, '0') ?: '0';
+            
+            $count = 0;
+            while (self::compareStrings($temp, $b) >= 0) {
+                $temp = self::subtractStrings($temp, $b);
+                $count++;
+            }
+            
+            $result .= $count;
+        }
+        
+        return ltrim($result, '0') ?: '0';
+    }
+    
+    private static function modString($a, $b) {
+        $quotient = self::divideString($a, $b);
+        $product = self::multiplyStrings($quotient, $b);
+        return self::subtractStrings($a, $product);
+    }
+    
+    private static function subtractStrings($a, $b) {
+        if (self::compareStrings($a, $b) < 0) return '0';
+        
+        $result = '';
+        $borrow = 0;
+        $i = strlen($a) - 1;
+        $j = strlen($b) - 1;
+        
+        while ($i >= 0) {
+            $sub = intval($a[$i]) - $borrow;
+            if ($j >= 0) $sub -= intval($b[$j--]);
+            
+            if ($sub < 0) {
+                $sub += 10;
+                $borrow = 1;
+            } else {
+                $borrow = 0;
+            }
+            
+            $result = $sub . $result;
+            $i--;
+        }
+        
+        return ltrim($result, '0') ?: '0';
+    }
+    
+    private static function decimalToHex($decimal) {
+        if ($decimal === '0') return '0';
+        
+        $hex = '';
+        while (self::compareStrings($decimal, '0') > 0) {
+            $remainder = self::modString($decimal, '16');
+            $hex = dechex(intval($remainder)) . $hex;
+            $decimal = self::divideString($decimal, '16');
+        }
+        
+        return $hex;
+    }
+    
+    /**
+     * Validate TRON address
+     * @param string $address
+     * @return bool
+     */
+    public static function isValidTronAddress($address) {
+        try {
+            // Check if address starts with 'T' and has correct length
+            if (strlen($address) !== 34 || $address[0] !== 'T') {
                 return false;
             }
-        }
-        
-        return true;
-    }
-    
-    public static function validatePrivateKey(string $privateKey): bool {
-        return strlen($privateKey) === 64 && ctype_xdigit($privateKey);
-    }
-    
-    public static function getAddressFromPrivateKey(string $privateKeyHex): string {
-        if (!self::validatePrivateKey($privateKeyHex)) {
-            throw new InvalidArgumentException('Invalid private key');
-        }
-        
-        $result = self::generateFromPrivateKey($privateKeyHex);
-        
-        if (!$result['success']) {
-            throw new Exception($result['error']);
-        }
-        
-        return $result['address'];
-    }
-    
-    public static function generateMultipleWallets(int $count): array {
-        $wallets = [];
-        
-        for ($i = 0; $i < $count; $i++) {
-            $wallet = self::generateWallet();
-            if ($wallet['success']) {
-                $wallets[] = $wallet;
+            
+            // Decode the address
+            $decoded = self::base58Decode($address);
+            
+            // Check length (21 bytes address + 4 bytes checksum)
+            if (strlen($decoded) !== 25) {
+                return false;
             }
+            
+            // Extract address and checksum
+            $addressBytes = substr($decoded, 0, 21);
+            $checksum = substr($decoded, 21, 4);
+            
+            // Verify checksum
+            $calculatedChecksum = substr(hash('sha256', hash('sha256', $addressBytes, true), true), 0, 4);
+            
+            return $checksum === $calculatedChecksum;
+            
+        } catch (Exception $e) {
+            return false;
         }
-        
-        return $wallets;
     }
-}
-
-// Test function to verify wallet generation works
-function testWalletGeneration(): array {
-    try {
-        $wallet = TronWalletGenerator::generateWallet();
-        
-        if (!$wallet['success']) {
-            return ['success' => false, 'error' => $wallet['error']];
+    
+    /**
+     * Import wallet from private key
+     * @param string $privateKeyHex
+     * @return array
+     */
+    public static function importFromPrivateKey($privateKeyHex) {
+        try {
+            // Validate private key format
+            if (!ctype_xdigit($privateKeyHex) || strlen($privateKeyHex) !== 64) {
+                throw new Exception("Invalid private key format");
+            }
+            
+            // Generate address from private key
+            $address = self::privateKeyToAddress($privateKeyHex);
+            
+            if (!$address) {
+                throw new Exception("Failed to generate address from private key");
+            }
+            
+            return [
+                'success' => true,
+                'private_key' => $privateKeyHex,
+                'address' => $address,
+                'public_key' => self::privateKeyToPublicKey($privateKeyHex)
+            ];
+            
+        } catch (Exception $e) {
+            return [
+                'success' => false,
+                'error' => $e->getMessage()
+            ];
         }
-        
-        // Validate generated address
-        $isValidAddress = TronWalletGenerator::validateAddress($wallet['address']);
-        $isValidPrivateKey = TronWalletGenerator::validatePrivateKey($wallet['private_key']);
-        
-        return [
-            'success' => true,
-            'wallet' => $wallet,
-            'validation' => [
-                'address_valid' => $isValidAddress,
-                'private_key_valid' => $isValidPrivateKey
-            ]
-        ];
-    } catch (Exception $e) {
-        return ['success' => false, 'error' => $e->getMessage()];
     }
 }
 ?>

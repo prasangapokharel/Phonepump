@@ -1,0 +1,344 @@
+/* Trade Tokens Optimized CSS - Fast Loading */
+/* Minified and optimized for performance */
+
+/* Core Layout - Minimal overhead */
+.app {
+  min-height: 100vh;
+  background: #000;
+  padding-bottom: 100px;
+}
+.content {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+/* Balance Display - Optimized */
+.balance-display {
+  text-align: center;
+  padding: 20px;
+  margin-bottom: 20px;
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 16px;
+}
+.balance-amount {
+  font-size: 32px;
+  font-weight: 700;
+  color: #fff;
+  font-family: "SF Mono", Monaco, monospace;
+  margin: 0;
+}
+.balance-label {
+  color: #999;
+  font-size: 14px;
+  margin-top: 4px;
+}
+
+/* Market Info - Fast Render */
+.market-info {
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin-bottom: 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.market-price {
+  font-size: 14px;
+  color: #fff;
+  font-family: "SF Mono", Monaco, monospace;
+}
+.market-change {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.market-change.positive {
+  background: rgba(0, 255, 136, 0.1);
+  color: #00ff88;
+}
+.market-change.negative {
+  background: rgba(255, 68, 68, 0.1);
+  color: #ff4444;
+}
+
+/* Tabs - Optimized Animation */
+.trade-tabs {
+  display: flex;
+  background: #111;
+  border-radius: 12px;
+  margin-bottom: 20px;
+  overflow: hidden;
+}
+.tab-btn {
+  flex: 1;
+  padding: 12px;
+  border: none;
+  background: transparent;
+  font-weight: 600;
+  cursor: pointer;
+  color: #999;
+  transition: background 0.15s ease;
+}
+.tab-btn.active {
+  background: #333;
+  color: #fff;
+}
+.tab-content {
+  display: none;
+}
+.tab-content.active {
+  display: block;
+}
+
+/* Section Title */
+.section-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 16px;
+}
+
+/* Token List - Performance Optimized */
+.token-list {
+  background: #111;
+  border-radius: 16px;
+  border: 1px solid #333;
+  overflow: hidden;
+}
+.token-item {
+  padding: 16px 20px;
+  border-bottom: 1px solid #333;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+.token-item:hover {
+  background: #222;
+}
+.token-item:last-child {
+  border-bottom: none;
+}
+
+/* Token Icon - Fast Render */
+.token-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #333;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: bold;
+  margin-right: 12px;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.token-icon img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+/* Token Info - Optimized Layout */
+.token-info {
+  flex: 1;
+  min-width: 0;
+}
+.token-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.token-symbol {
+  font-size: 12px;
+  color: #999;
+  text-transform: uppercase;
+}
+.bonding-progress {
+  font-size: 10px;
+  color: #666;
+  margin-top: 2px;
+}
+
+/* Price Info - Right Aligned */
+.token-price-info {
+  text-align: right;
+  flex-shrink: 0;
+}
+.token-price {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  font-family: "SF Mono", Monaco, monospace;
+  margin-bottom: 2px;
+}
+.price-change {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.price-change.positive {
+  background: rgba(0, 255, 136, 0.1);
+  color: #00ff88;
+}
+.price-change.negative {
+  background: rgba(255, 68, 68, 0.1);
+  color: #ff4444;
+}
+.price-change.neutral {
+  background: rgba(153, 153, 153, 0.1);
+  color: #999;
+}
+
+/* User Balance Badge */
+.user-balance-badge {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  margin-left: 8px;
+}
+
+/* Portfolio - Optimized Grid */
+.portfolio-item {
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 12px;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+.portfolio-item:hover {
+  background: #1a1a1a;
+}
+.portfolio-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.portfolio-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  text-align: center;
+}
+.stat-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  font-family: "SF Mono", Monaco, monospace;
+}
+.stat-label {
+  font-size: 10px;
+  color: #999;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+/* Empty State */
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: #999;
+}
+.empty-text {
+  font-size: 16px;
+  margin-bottom: 16px;
+}
+.start-trading-btn {
+  background: #fff;
+  color: #000;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+.start-trading-btn:hover {
+  background: #f0f0f0;
+}
+
+/* Alerts - Fast Animation */
+.alert {
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  transition: opacity 0.3s ease;
+}
+.alert-success {
+  background: rgba(0, 255, 136, 0.1);
+  color: #00ff88;
+  border: 1px solid rgba(0, 255, 136, 0.3);
+}
+.alert-error {
+  background: rgba(255, 68, 68, 0.1);
+  color: #ff4444;
+  border: 1px solid rgba(255, 68, 68, 0.3);
+}
+.alert-warning {
+  background: rgba(255, 193, 7, 0.1);
+  color: #ffc107;
+  border: 1px solid rgba(255, 193, 7, 0.3);
+}
+
+/* Loading Indicator - Minimal */
+.loading-indicator {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #333;
+  border-radius: 50%;
+  border-top-color: #fff;
+  animation: spin 1s linear infinite;
+  margin-left: 8px;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Mobile Optimizations */
+@media (max-width: 480px) {
+  .content {
+    padding: 16px;
+  }
+  .balance-amount {
+    font-size: 28px;
+  }
+  .token-item {
+    padding: 12px 16px;
+  }
+  .portfolio-stats {
+    gap: 8px;
+  }
+}
+
+/* Performance Optimizations */
+* {
+  box-sizing: border-box;
+}
+.token-item,
+.portfolio-item {
+  will-change: background;
+}
+.tab-btn {
+  will-change: background, color;
+}

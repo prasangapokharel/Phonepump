@@ -1,0 +1,368 @@
+/* Launch Token Optimized CSS - Ultra Fast Loading */
+/* Compressed and performance-focused */
+
+/* Core App Layout */
+.app {
+  min-height: 100vh;
+  background: #000;
+  padding-bottom: 100px; /* Changed from 80px to 100px to match dashboard */
+}
+.content {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+/* Balance Display - Enhanced */
+.balance-display {
+  text-align: center;
+  padding: 20px;
+  margin-bottom: 20px;
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 16px;
+}
+.balance-amount {
+  font-size: 32px;
+  font-weight: 700;
+  color: #fff;
+  font-family: "SF Mono", Monaco, monospace;
+  margin: 0;
+}
+.balance-label {
+  color: #999;
+  font-size: 14px;
+  margin-top: 4px;
+}
+.balance-usd {
+  color: #666;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* Form Elements - Optimized */
+.form-group {
+  margin-bottom: 20px;
+}
+.form-group label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 600;
+  color: #fff;
+  font-size: 14px;
+}
+.form-group input,
+.form-group textarea,
+.form-group select {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #333;
+  background: #111;
+  color: #fff;
+  font-size: 16px;
+  border-radius: 8px;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease;
+}
+.form-group input:focus,
+.form-group textarea:focus {
+  outline: none;
+  border-color: #fff;
+}
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+}
+
+/* Initial Buy Section - Fast Render */
+.initial-buy-section {
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 20px;
+  margin: 20px 0;
+}
+.initial-buy-header {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #fff;
+}
+.initial-buy-subtitle {
+  color: #999;
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+
+/* Balance Info */
+.balance-info {
+  background: #222;
+  padding: 12px;
+  margin-bottom: 16px;
+  border: 1px solid #333;
+  border-radius: 8px;
+}
+.balance-text {
+  color: #999;
+  font-size: 14px;
+}
+
+/* Calculation Display - Optimized */
+.calculation-display {
+  background: #222;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 16px;
+  margin-top: 12px;
+}
+.calc-row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+.calc-row:last-child {
+  border-top: 1px solid #333;
+  padding-top: 8px;
+  font-weight: 600;
+  margin-bottom: 0;
+}
+.calc-label {
+  color: #999;
+}
+.calc-value {
+  color: #fff;
+  font-family: "SF Mono", Monaco, monospace;
+}
+
+/* Bonding Curve Info */
+.bonding-curve-info {
+  background: #222;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  color: #999;
+}
+.bonding-curve-info h4 {
+  color: #fff;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+/* Launch Button - Optimized */
+.launch-btn {
+  width: 100%;
+  background: #fff;
+  color: #000;
+  border: none;
+  border-radius: 8px;
+  padding: 16px;
+  font-size: 18px;
+  font-weight: 600;
+  cursor: pointer;
+  text-transform: uppercase;
+  margin-bottom: 40px;
+  transition: background 0.15s ease;
+}
+.launch-btn:hover {
+  background: #f0f0f0;
+}
+.launch-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Token Cards - Fast Render */
+.token-card {
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 15px;
+  transition: background 0.1s ease;
+}
+.token-card:hover {
+  background: #1a1a1a;
+}
+.token-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 15px;
+}
+.token-image {
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  border: 1px solid #333;
+  margin-right: 15px;
+  object-fit: cover;
+  background: #222;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: bold;
+  flex-shrink: 0;
+}
+.token-info h3 {
+  margin: 0;
+  font-size: 18px;
+  color: #fff;
+}
+.token-symbol {
+  color: #999;
+  font-size: 14px;
+}
+
+/* Progress Bar - Smooth Animation */
+.progress-bar {
+  width: 100%;
+  height: 8px;
+  background: #333;
+  border-radius: 4px;
+  margin: 10px 0;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #fff, #aaa);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+/* Token Stats - Grid Optimized */
+.token-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 15px;
+  margin-top: 15px;
+  padding-top: 15px;
+  border-top: 1px solid #333;
+}
+.stat {
+  text-align: center;
+}
+.stat-value {
+  font-size: 16px;
+  font-weight: 600;
+  color: #fff;
+  font-family: "SF Mono", Monaco, monospace;
+}
+.stat-label {
+  font-size: 12px;
+  color: #999;
+  text-transform: uppercase;
+  margin-top: 4px;
+}
+
+/* Alerts - Fast Animation */
+.alert {
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  transition: opacity 0.3s ease;
+}
+.alert-success {
+  background: rgba(0, 255, 136, 0.1);
+  color: #00ff88;
+  border: 1px solid rgba(0, 255, 136, 0.3);
+}
+.alert-error {
+  background: rgba(255, 68, 68, 0.1);
+  color: #ff4444;
+  border: 1px solid rgba(255, 68, 68, 0.3);
+}
+.alert-warning {
+  background: rgba(255, 193, 7, 0.1);
+  color: #ffc107;
+  border: 1px solid rgba(255, 193, 7, 0.3);
+}
+
+/* Insufficient Amount Warning */
+.insufficient-amount {
+  color: #ff6b6b;
+  font-weight: 600;
+  margin-top: 8px;
+  font-size: 14px;
+}
+
+/* Section Title */
+.section-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: #fff;
+  margin: 40px 0 20px 0;
+}
+
+/* Loading Indicator */
+.loading-indicator {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #333;
+  border-radius: 50%;
+  border-top-color: #fff;
+  animation: spin 1s linear infinite;
+  margin-left: 8px;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Mobile Optimizations - Performance First */
+@media (max-width: 480px) {
+  .content {
+    padding: 16px;
+  }
+  .form-row {
+    grid-template-columns: 1fr;
+  }
+  .balance-amount {
+    font-size: 28px;
+  }
+  .token-stats {
+    gap: 10px;
+  }
+  .initial-buy-section {
+    padding: 16px;
+  }
+}
+
+/* Performance Optimizations */
+* {
+  box-sizing: border-box;
+}
+.token-card,
+.launch-btn {
+  will-change: background;
+}
+input,
+textarea {
+  will-change: border-color;
+}
+
+/* File Input Styling */
+input[type="file"] {
+  padding: 8px;
+  background: #222;
+  border: 1px solid #444;
+}
+
+/* Textarea Specific */
+textarea {
+  resize: vertical;
+  min-height: 80px;
+}
+
+/* Focus States - Minimal */
+input:focus,
+textarea:focus,
+select:focus {
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.1);
+}

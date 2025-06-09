@@ -7,6 +7,13 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
+// Include Composer autoloader for Guzzle and Symfony Cache
+require_once "../vendor/autoload.php";
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\RequestException;
+use Symfony\Component\Cache\Adapter\FilesystemAdapter;
+
 $user_id = $_SESSION['user_id'];
 $token_id = intval($_GET['token_id'] ?? 0);
 
@@ -15,12 +22,52 @@ if (!$token_id) {
     exit;
 }
 
-// Get user wallet
-$stmt = $pdo->prepare("SELECT * FROM trxbalance WHERE user_id = ?");
-$stmt->execute([$user_id]);
-$wallet = $stmt->fetch();
+// Initialize Guzzle HTTP Client
+$httpClient = new Client([
+    'timeout' => 5,
+    'connect_timeout' => 3,
+    'headers' => [
+        'User-Agent' => 'TRX-Trading/2.0',
+        'Accept' => 'application/json'
+    ]
+]);
 
-// Get token details with latest price
+// Initialize Cache
+try {
+    $cache = new FilesystemAdapter(
+        'trading_cache',
+        300, // 5 minutes TTL
+        '../cache'
+    );
+} catch (Exception $e) {
+    // Fallback cache
+    $cache = new class {
+        private $data = [];
+        public function getItem($key) {
+            return new class($key, $this->data) {
+                private $key, $data, $value, $hit = false;
+                public function __construct($key, &$data) {
+                    $this->key = $key;
+                    $this->data = &$data;
+                    if (isset($data[$key]) && $data[$key]['expires'] > time()) {
+                        $this->value = $data[$key]['value'];
+                        $this->hit = true;
+                    }
+                }
+                public function isHit() { return $this->hit; }
+                public function get() { return $this->value; }
+                public function set($value) { $this->value = $value; return $this; }
+                public function expiresAfter($seconds) { 
+                    $this->data[$this->key] = ['value' => $this->value, 'expires' => time() + $seconds];
+                    return $this;
+                }
+            };
+        }
+        public function save($item) { return true; }
+    };
+}
+
+// Get token data
 $stmt = $pdo->prepare("
     SELECT t.*, bc.*, 
            COALESCE(tb.balance, 0) as user_balance,
@@ -44,6 +91,11 @@ if (!empty($token['latest_price'])) {
     $token['current_price'] = $token['latest_price'];
 }
 
+// Get user wallet
+$stmt = $pdo->prepare("SELECT * FROM trxbalance WHERE user_id = ?");
+$stmt->execute([$user_id]);
+$wallet = $stmt->fetch();
+
 // Get company settings
 $stmt = $pdo->prepare("SELECT setting_name, setting_value FROM company_settings");
 $stmt->execute();
@@ -51,11 +103,20 @@ $settings = [];
 while ($row = $stmt->fetch()) {
     $settings[$row['setting_name']] = $row['setting_value'];
 }
+$tradingFee = floatval($settings['trading_fee_trx'] ?? 10);
 
-$trading_fee = floatval($settings['trading_fee_trx'] ?? 10);
-$company_wallet = $settings['company_wallet_address'] ?? 'TCompanyWallet123';
+// Get recent trades
+$stmt = $pdo->prepare("
+    SELECT transaction_type, price_per_token, token_amount, created_at
+    FROM token_transactions
+    WHERE token_id = ? AND status = 'confirmed'
+    ORDER BY created_at DESC
+    LIMIT 20
+");
+$stmt->execute([$token_id]);
+$recentTrades = $stmt->fetchAll();
 
-// Calculate price change (24h)
+// Calculate 24h price change with proper percentage
 $stmt = $pdo->prepare("
     SELECT 
         (SELECT price_per_token FROM token_transactions 
@@ -64,283 +125,167 @@ $stmt = $pdo->prepare("
         (SELECT price_per_token FROM token_transactions 
          WHERE token_id = ? AND status = 'confirmed' 
          AND created_at <= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-         ORDER BY created_at DESC LIMIT 1) as price_24h_ago
+         ORDER BY created_at DESC LIMIT 1) as price_24h_ago,
+        (SELECT COUNT(*) FROM token_transactions 
+         WHERE token_id = ? AND status = 'confirmed' 
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) as trades_24h
 ");
-$stmt->execute([$token_id, $token_id]);
-$price_data = $stmt->fetch();
+$stmt->execute([$token_id, $token_id, $token_id]);
+$priceData = $stmt->fetch();
 
-$price_change_24h = 0;
-if ($price_data && $price_data['price_24h_ago'] > 0) {
-    $price_change_24h = (($price_data['current_price'] - $price_data['price_24h_ago']) / $price_data['price_24h_ago']) * 100;
+$priceChange24h = 0;
+$priceChangeAbs = 0;
+if ($priceData && $priceData['price_24h_ago'] > 0 && $priceData['current_price'] > 0) {
+    $priceChangeAbs = $priceData['current_price'] - $priceData['price_24h_ago'];
+    $priceChange24h = ($priceChangeAbs / $priceData['price_24h_ago']) * 100;
+} else if ($priceData && $priceData['current_price'] > 0) {
+    // If no 24h ago price, use the current price (new token)
+    $priceChangeAbs = 0;
+    $priceChange24h = 0;
 }
 
-// Get recent transactions for chart data
-$stmt = $pdo->prepare("
-    SELECT 
-        DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:00') as time_bucket,
-        AVG(price_per_token) as avg_price,
-        MAX(price_per_token) as high_price,
-        MIN(price_per_token) as low_price,
-        SUM(trx_amount) as volume,
-        COUNT(*) as trade_count
-    FROM token_transactions 
-    WHERE token_id = ? AND status = 'confirmed'
-    AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-    GROUP BY time_bucket
-    ORDER BY time_bucket ASC
-");
-$stmt->execute([$token_id]);
-$chart_data = $stmt->fetchAll();
-
-// Get order book data (recent transactions)
-$stmt = $pdo->prepare("
-    SELECT tt.*, u.username
-    FROM token_transactions tt
-    LEFT JOIN users2 u ON tt.user_id = u.id
-    WHERE tt.token_id = ? AND tt.status = 'confirmed'
-    ORDER BY tt.created_at DESC
-    LIMIT 50
-");
-$stmt->execute([$token_id]);
-$recent_trades = $stmt->fetchAll();
-
-// Get 24h stats
-$stmt = $pdo->prepare("
-    SELECT 
-        SUM(trx_amount) as volume_24h,
-        MAX(price_per_token) as high_24h,
-        MIN(price_per_token) as low_24h
-    FROM token_transactions
-    WHERE token_id = ? AND status = 'confirmed'
-    AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-");
-$stmt->execute([$token_id]);
-$stats_24h = $stmt->fetch();
-
+// Process trade if form submitted
 $error = "";
 $success = "";
 
-// Handle trading - FIXED DIVISION BY ZERO ERROR
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['trade_action'])) {
-    $action = $_POST['trade_action'];
-    $amount = floatval($_POST['amount']);
-    $order_type = $_POST['order_type'] ?? 'market';
-    $limit_price = floatval($_POST['limit_price'] ?? 0);
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['trade_action'] ?? '';
+    $amount = floatval($_POST['amount'] ?? 0);
+    $orderType = $_POST['order_type'] ?? 'market';
+    $limitPrice = floatval($_POST['limit_price'] ?? 0);
     
-    // Validate amount first
     if ($amount <= 0) {
-        $error = "Invalid amount. Please enter a positive number.";
+        $error = "Please enter a valid amount";
     } else {
         try {
             $pdo->beginTransaction();
             
+            // Calculate price based on order type
+            $price = ($orderType === 'limit' && $limitPrice > 0) ? $limitPrice : $token['current_price'];
+            
             if ($action === 'buy') {
-                $price_per_token = ($order_type === 'limit' && $limit_price > 0) ? $limit_price : $token['current_price'];
-                $total_cost = $amount * $price_per_token;
-                $total_with_fee = $total_cost + $trading_fee;
+                $totalCost = ($amount * $price) + $tradingFee;
                 
-                if ($wallet['balance'] < $total_with_fee) {
-                    $error = "Insufficient TRX balance. Need " . number_format($total_with_fee, 4) . " TRX.";
-                } else {
-                    // Process buy
-                    $stmt = $pdo->prepare("UPDATE trxbalance SET balance = balance - ? WHERE user_id = ?");
-                    $stmt->execute([$total_with_fee, $user_id]);
-                    
-                    $stmt = $pdo->prepare("
-                        UPDATE bonding_curves SET 
-                            real_trx_reserves = real_trx_reserves + ?,
-                            tokens_available = tokens_available - ?,
-                            tokens_sold = tokens_sold + ?,
-                            current_progress = LEAST(100.0, (real_trx_reserves + ?) / graduation_threshold * 100)
-                        WHERE token_id = ?
-                    ");
-                    $stmt->execute([$total_cost, $amount, $amount, $total_cost, $token_id]);
-                    
-                    $stmt = $pdo->prepare("
-                        INSERT INTO token_balances (token_id, user_id, balance, first_purchase_at, last_transaction_at, total_bought)
-                        VALUES (?, ?, ?, NOW(), NOW(), ?)
-                        ON DUPLICATE KEY UPDATE
-                            balance = balance + VALUES(balance),
-                            last_transaction_at = NOW(),
-                            total_bought = total_bought + VALUES(total_bought)
-                    ");
-                    $stmt->execute([$token_id, $user_id, $amount, $amount]);
-                    
-                    $tx_hash = 'tx_' . uniqid();
-                    $stmt = $pdo->prepare("
-                        INSERT INTO token_transactions (
-                            token_id, user_id, transaction_hash, transaction_type,
-                            trx_amount, token_amount, price_per_token, fee_amount,
-                            status, created_at
-                        ) VALUES (?, ?, ?, 'buy', ?, ?, ?, ?, 'confirmed', NOW())
-                    ");
-                    $stmt->execute([$token_id, $user_id, $tx_hash, $total_cost, $amount, $price_per_token, $trading_fee]);
-                    
-                    // Record fee transaction
-                    $fee_tx_hash = 'fee_' . uniqid();
-                    $stmt = $pdo->prepare("
-                        INSERT INTO trxhistory (
-                            user_id, amount, status, timestamp, tx_hash, 
-                            from_address, to_address, transaction_type
-                        ) VALUES (?, ?, 'confirmed', NOW(), ?, ?, ?, 'trading_fee')
-                    ");
-                    $stmt->execute([
-                        $user_id, -$trading_fee, $fee_tx_hash, 
-                        $wallet['address'], $company_wallet
-                    ]);
-                    
-                    $stmt = $pdo->prepare("
-                        UPDATE tokens SET 
-                            current_price = ?,
-                            total_transactions = total_transactions + 1,
-                            volume_total = volume_total + ?,
-                            volume_24h = volume_24h + ?
-                        WHERE id = ?
-                    ");
-                    $stmt->execute([$price_per_token, $total_cost, $total_cost, $token_id]);
-                    
-                    $success = "Buy order executed successfully! Bought " . number_format($amount, 2) . " tokens for " . number_format($total_cost, 4) . " TRX.";
+                if ($wallet['balance'] < $totalCost) {
+                    throw new Exception("Insufficient TRX balance. You need " . number_format($totalCost, 4) . " TRX.");
                 }
-            } else { // SELL - FIXED DIVISION BY ZERO ERROR
+                
+                // Update user TRX balance
+                $stmt = $pdo->prepare("UPDATE trxbalance SET balance = balance - ? WHERE user_id = ?");
+                $stmt->execute([$totalCost, $user_id]);
+                
+                // Update token balances
+                $stmt = $pdo->prepare("
+                    INSERT INTO token_balances (token_id, user_id, balance, first_purchase_at, last_transaction_at, total_bought)
+                    VALUES (?, ?, ?, NOW(), NOW(), ?)
+                    ON DUPLICATE KEY UPDATE
+                        balance = balance + VALUES(balance),
+                        last_transaction_at = NOW(),
+                        total_bought = total_bought + VALUES(total_bought)
+                ");
+                $stmt->execute([$token_id, $user_id, $amount, $amount]);
+                
+                // Record transaction
+                $txHash = 'tx_' . uniqid();
+                $stmt = $pdo->prepare("
+                    INSERT INTO token_transactions (
+                        token_id, user_id, transaction_hash, transaction_type,
+                        trx_amount, token_amount, price_per_token, fee_amount,
+                        status, created_at
+                    ) VALUES (?, ?, ?, 'buy', ?, ?, ?, ?, 'confirmed', NOW())
+                ");
+                $stmt->execute([$token_id, $user_id, $txHash, $amount * $price, $amount, $price, $tradingFee]);
+                
+                $success = "Successfully bought " . number_format($amount, 2) . " tokens for " . number_format($amount * $price, 4) . " TRX";
+                
+            } else { // sell
                 if ($token['user_balance'] < $amount) {
-                    $error = "Insufficient token balance. You have " . number_format($token['user_balance'], 2) . " tokens.";
-                } else {
-                    $is_creator = ($user_id == $token['creator_id']);
-                    $has_external_buys = ($token['external_buys'] > 0);
-                    
-                    // Initialize variables to prevent division by zero
-                    $price_per_token = 0;
-                    $trx_received = 0;
-                    
-                    // Calculate sell price and TRX received - FIXED DIVISION BY ZERO
-                    if ($is_creator && !$has_external_buys && !empty($token['initial_buy_amount']) && $token['initial_buy_amount'] > 0) {
-                        // Special case: Creator selling with no external buys - return proportional initial investment
-                        $creator_total_tokens = floatval($token['creator_initial_tokens']) + floatval($token['tokens_sold']);
-                        
-                        if ($creator_total_tokens > 0 && $amount > 0) {
-                            $sell_percentage = $amount / $creator_total_tokens;
-                            $trx_received = floatval($token['initial_buy_amount']) * $sell_percentage;
-                            $price_per_token = $trx_received / $amount; // Safe division - amount > 0 checked above
-                        } else {
-                            // Fallback to market price if calculation fails
-                            $price_per_token = ($order_type === 'limit' && $limit_price > 0) ? $limit_price : $token['current_price'];
-                            $trx_received = $amount * $price_per_token;
-                        }
-                    } else {
-                        // Normal market sell
-                        $price_per_token = ($order_type === 'limit' && $limit_price > 0) ? $limit_price : $token['current_price'];
-                        $trx_received = $amount * $price_per_token;
-                    }
-                    
-                    // Additional safety check
-                    if ($price_per_token <= 0) {
-                        $price_per_token = $token['current_price'];
-                        $trx_received = $amount * $price_per_token;
-                    }
-                    
-                    // Check if transaction covers trading fee
-                    if ($trx_received <= $trading_fee) {
-                        if ($price_per_token > 0) {
-                            $min_tokens_needed = ceil(($trading_fee + 0.0001) / $price_per_token);
-                            $error = "Amount too small to cover trading fee. Minimum required: " . number_format($min_tokens_needed, 2) . " tokens.";
-                        } else {
-                            $error = "Cannot calculate minimum tokens required. Price is zero.";
-                        }
-                    } else {
-                        $total_after_fee = $trx_received - $trading_fee;
-                        
-                        // Update user TRX balance
-                        $stmt = $pdo->prepare("UPDATE trxbalance SET balance = balance + ? WHERE user_id = ?");
-                        $stmt->execute([$total_after_fee, $user_id]);
-                        
-                        // Update bonding curve reserves
-                        $stmt = $pdo->prepare("
-                            UPDATE bonding_curves SET 
-                                real_trx_reserves = GREATEST(0, real_trx_reserves - ?),
-                                tokens_available = tokens_available + ?,
-                                tokens_sold = GREATEST(0, tokens_sold - ?),
-                                current_progress = LEAST(100.0, GREATEST(0, real_trx_reserves - ?) / graduation_threshold * 100)
-                            WHERE token_id = ?
-                        ");
-                        $stmt->execute([$trx_received, $amount, $amount, $trx_received, $token_id]);
-                        
-                        // Update user token balance
-                        $stmt = $pdo->prepare("
-                            UPDATE token_balances SET 
-                                balance = GREATEST(0, balance - ?),
-                                last_transaction_at = NOW(),
-                                total_sold = total_sold + ?
-                            WHERE token_id = ? AND user_id = ?
-                        ");
-                        $stmt->execute([$amount, $amount, $token_id, $user_id]);
-                        
-                        // Record sell transaction
-                        $tx_hash = 'tx_' . uniqid();
-                        $stmt = $pdo->prepare("
-                            INSERT INTO token_transactions (
-                                token_id, user_id, transaction_hash, transaction_type,
-                                trx_amount, token_amount, price_per_token, fee_amount,
-                                status, created_at
-                            ) VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, 'confirmed', NOW())
-                        ");
-                        $stmt->execute([$token_id, $user_id, $tx_hash, $trx_received, $amount, $price_per_token, $trading_fee]);
-                        
-                        // Record fee transaction
-                        $fee_tx_hash = 'fee_' . uniqid();
-                        $stmt = $pdo->prepare("
-                            INSERT INTO trxhistory (
-                                user_id, amount, status, timestamp, tx_hash, 
-                                from_address, to_address, transaction_type
-                            ) VALUES (?, ?, 'confirmed', NOW(), ?, ?, ?, 'trading_fee')
-                        ");
-                        $stmt->execute([
-                            $user_id, -$trading_fee, $fee_tx_hash, 
-                            $wallet['address'], $company_wallet
-                        ]);
-                        
-                        // Update token stats
-                        $stmt = $pdo->prepare("
-                            UPDATE tokens SET 
-                                current_price = ?,
-                                total_transactions = total_transactions + 1,
-                                volume_total = volume_total + ?,
-                                volume_24h = volume_24h + ?
-                            WHERE id = ?
-                        ");
-                        $stmt->execute([$price_per_token, $trx_received, $trx_received, $token_id]);
-                        
-                        $success = "Sell order executed successfully! Sold " . number_format($amount, 2) . " tokens for " . number_format($total_after_fee, 4) . " TRX (after " . $trading_fee . " TRX fee).";
-                    }
+                    throw new Exception("Insufficient token balance. You have " . number_format($token['user_balance'], 2) . " tokens.");
                 }
+                
+                $trxReceived = $amount * $price;
+                $totalAfterFee = $trxReceived - $tradingFee;
+                
+                if ($totalAfterFee <= 0) {
+                    throw new Exception("Amount too small to cover trading fee.");
+                }
+                
+                // Update user TRX balance
+                $stmt = $pdo->prepare("UPDATE trxbalance SET balance = balance + ? WHERE user_id = ?");
+                $stmt->execute([$totalAfterFee, $user_id]);
+                
+                // Update token balances
+                $stmt = $pdo->prepare("
+                    UPDATE token_balances SET 
+                        balance = balance - ?,
+                        last_transaction_at = NOW(),
+                        total_sold = total_sold + ?
+                    WHERE token_id = ? AND user_id = ?
+                ");
+                $stmt->execute([$amount, $amount, $token_id, $user_id]);
+                
+                // Record transaction
+                $txHash = 'tx_' . uniqid();
+                $stmt = $pdo->prepare("
+                    INSERT INTO token_transactions (
+                        token_id, user_id, transaction_hash, transaction_type,
+                        trx_amount, token_amount, price_per_token, fee_amount,
+                        status, created_at
+                    ) VALUES (?, ?, ?, 'sell', ?, ?, ?, ?, 'confirmed', NOW())
+                ");
+                $stmt->execute([$token_id, $user_id, $txHash, $trxReceived, $amount, $price, $tradingFee]);
+                
+                $success = "Successfully sold " . number_format($amount, 2) . " tokens for " . number_format($totalAfterFee, 4) . " TRX";
             }
             
-            if (empty($error)) {
-                $pdo->commit();
-                
-                // Refresh token data after successful transaction
+            // Update token current price after successful trade
+            $stmt = $pdo->prepare("UPDATE tokens SET current_price = ?, market_cap = current_price * total_supply WHERE id = ?");
+            $stmt->execute([$price, $token_id]);
+
+            // Update bonding curve data
+            if ($action === 'buy') {
                 $stmt = $pdo->prepare("
-                    SELECT t.*, bc.*, 
-                           COALESCE(tb.balance, 0) as user_balance,
-                           (SELECT COUNT(*) FROM token_transactions WHERE token_id = t.id AND transaction_type = 'buy' AND user_id != t.creator_id) as external_buys
-                    FROM tokens t 
-                    LEFT JOIN bonding_curves bc ON t.id = bc.token_id 
-                    LEFT JOIN token_balances tb ON t.id = tb.token_id AND tb.user_id = ?
-                    WHERE t.id = ?
+                    UPDATE bonding_curves SET 
+                        virtual_trx_reserves = virtual_trx_reserves + ?,
+                        virtual_token_reserves = virtual_token_reserves - ?,
+                        tokens_sold = tokens_sold + ?,
+                        real_trx_reserves = real_trx_reserves + ?
+                    WHERE token_id = ?
                 ");
-                $stmt->execute([$user_id, $token_id]);
-                $token = $stmt->fetch();
-                
-                // Refresh wallet data
-                $stmt = $pdo->prepare("SELECT * FROM trxbalance WHERE user_id = ?");
-                $stmt->execute([$user_id]);
-                $wallet = $stmt->fetch();
+                $stmt->execute([$amount * $price, $amount, $amount, $amount * $price, $token_id]);
             } else {
-                $pdo->rollBack();
+                $stmt = $pdo->prepare("
+                    UPDATE bonding_curves SET 
+                        virtual_trx_reserves = virtual_trx_reserves - ?,
+                        virtual_token_reserves = virtual_token_reserves + ?,
+                        tokens_sold = tokens_sold - ?,
+                        real_trx_reserves = real_trx_reserves - ?
+                    WHERE token_id = ?
+                ");
+                $stmt->execute([$trxReceived, $amount, $amount, $trxReceived, $token_id]);
             }
+            
+            $pdo->commit();
+            
+            // Refresh data after successful transaction
+            $stmt = $pdo->prepare("SELECT * FROM trxbalance WHERE user_id = ?");
+            $stmt->execute([$user_id]);
+            $wallet = $stmt->fetch();
+            
+            $stmt = $pdo->prepare("
+                SELECT t.*, bc.*, 
+                       COALESCE(tb.balance, 0) as user_balance
+                FROM tokens t 
+                LEFT JOIN bonding_curves bc ON t.id = bc.token_id 
+                LEFT JOIN token_balances tb ON t.id = tb.token_id AND tb.user_id = ?
+                WHERE t.id = ?
+            ");
+            $stmt->execute([$user_id, $token_id]);
+            $token = $stmt->fetch();
             
         } catch (Exception $e) {
             $pdo->rollBack();
-            $error = "Transaction failed: " . $e->getMessage();
+            $error = $e->getMessage();
         }
     }
 }
@@ -351,160 +296,305 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['trade_action'])) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?php echo htmlspecialchars($token['name']); ?> - Advanced Trading</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <title><?php echo htmlspecialchars($token['name']); ?> Trading</title>
     <style>
+        /* Reset and Base Styles */
         * {margin:0; padding:0; box-sizing:border-box;}
-        body {font-family:system-ui, -apple-system, sans-serif; background:#0a0a0a; color:#fff; overflow-x:hidden;}
+        body {font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:#0a0a0a; color:#fff; overflow:hidden;}
         
-        .trading-container {display:grid; grid-template-columns:1fr 350px; grid-template-rows:60px 1fr; height:100vh; gap:1px; background:#111;}
-        .header {grid-column:1/-1; background:#1a1a1a; display:flex; align-items:center; justify-content:space-between; padding:0 20px; border-bottom:1px solid #333;}
-        .token-info {display:flex; align-items:center; gap:15px;}
-        .token-image {width:40px; height:40px; border-radius:50%; background:#333; display:flex; align-items:center; justify-content:center; font-weight:bold;}
-        .token-details h1 {font-size:20px; margin-bottom:2px;}
-        .token-symbol {color:#999; font-size:14px;}
-        .price-info {display:flex; align-items:center; gap:20px;}
-        .current-price {font-size:24px; font-weight:700; color:#00d4aa;}
-        .price-change {padding:4px 8px; border-radius:4px; font-size:12px; font-weight:600;}
-        .price-change.positive {background:#00d4aa20; color:#00d4aa;}
-        .price-change.negative {background:#ff445520; color:#ff4455;}
-        .nav-actions {display:flex; gap:10px;}
-        .back-btn {background:#333; color:#fff; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; text-decoration:none; font-size:14px;}
-        .back-btn:hover {background:#444;}
+        /* Layout */
+        .trading-app {display:grid; grid-template-columns:1fr 350px; height:100vh; overflow:hidden;}
+        .chart-area {background:#111; position:relative; overflow:hidden;}
+        .trading-panel {background:#111; border-left:1px solid #222; overflow-y:auto;}
         
-        .main-content {background:#0f0f0f; display:flex; flex-direction:column; overflow:hidden;}
-        .chart-section {flex:1; padding:20px; display:flex; flex-direction:column;}
-        .chart-controls {display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;}
-        .time-intervals {display:flex; gap:5px;}
-        .interval-btn {background:#222; color:#999; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:600; transition:all 0.2s;}
+        /* Header */
+        .app-header {display:flex; align-items:center; justify-content:space-between; padding:12px 20px; background:#111; border-bottom:1px solid #222;}
+        .token-info {display:flex; align-items:center; gap:10px;}
+        .token-icon {width:32px; height:32px; border-radius:50%; background:#222; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:12px;}
+        .token-icon img {width:100%; height:100%; border-radius:50%; object-fit:cover;}
+        .token-name {font-size:18px; font-weight:600;}
+        .token-symbol {font-size:12px; color:#999;}
+        .price-display {text-align:right;}
+        .current-price {font-size:20px; color:#00d4aa; font-weight:600;}
+        .price-change {font-size:12px; padding:2px 6px; border-radius:4px; display:inline-block; margin-top:4px;}
+        .price-change.positive {background:rgba(0,212,170,0.1); color:#00d4aa;}
+        .price-change.negative {background:rgba(255,68,85,0.1); color:#ff4455;}
+        
+        /* Chart Controls */
+        .chart-controls {padding:10px 20px; border-bottom:1px solid #222; display:flex; justify-content:space-between;}
+        .time-intervals {display:flex; gap:4px;}
+        .interval-btn {background:#222; color:#999; border:none; padding:6px 12px; border-radius:4px; font-size:12px; cursor:pointer; transition:all 0.2s;}
+        .interval-btn:hover {background:#333;}
         .interval-btn.active {background:#00d4aa; color:#000;}
-        .interval-btn:hover {background:#333; color:#fff;}
-        .chart-container {flex:1; position:relative; background:#111; border-radius:8px; padding:20px;}
         
-        .sidebar {background:#111; display:flex; flex-direction:column; overflow-y:auto;}
-        .trading-panel {padding:20px; border-bottom:1px solid #222;}
-        .panel-title {font-size:16px; font-weight:600; margin-bottom:15px; color:#fff;}
+        /* Pure CSS Chart */
+        .chart-container {height:calc(100% - 100px); padding:20px; position:relative; background:#0a0a0a;}
         
-        .order-type-tabs {display:flex; margin-bottom:20px; background:#222; border-radius:6px; padding:2px;}
-        .order-tab {flex:1; background:transparent; color:#999; border:none; padding:8px; border-radius:4px; cursor:pointer; font-size:12px; font-weight:600; transition:all 0.2s;}
+        .css-chart-wrapper {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, #0a0a0a 0%, #111 100%);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        .css-chart {
+            position: relative;
+            width: 100%;
+            height: calc(100% - 40px);
+            display: flex;
+            align-items: flex-end;
+            padding: 20px;
+            gap: 2px;
+        }
+        
+        .chart-bar {
+            flex: 1;
+            background: linear-gradient(to top, rgba(0,212,170,0.2), rgba(0,212,170,0.8));
+            position: relative;
+            min-height: 2px;
+            border-radius: 2px 2px 0 0;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        
+        .chart-bar.up {
+            background: linear-gradient(to top, rgba(0,212,170,0.2), rgba(0,212,170,0.8));
+            box-shadow: 0 0 10px rgba(0,212,170,0.3);
+        }
+        
+        .chart-bar.down {
+            background: linear-gradient(to top, rgba(255,68,85,0.2), rgba(255,68,85,0.8));
+            box-shadow: 0 0 10px rgba(255,68,85,0.3);
+        }
+        
+        .chart-bar:hover {
+            transform: scaleY(1.05);
+            filter: brightness(1.2);
+        }
+        
+        .chart-bar:hover::after {
+            content: attr(data-price);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.9);
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            white-space: nowrap;
+            z-index: 10;
+            border: 1px solid #333;
+        }
+        
+        .chart-grid {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            right: 20px;
+            bottom: 60px;
+            pointer-events: none;
+        }
+        
+        .grid-line {
+            position: absolute;
+            width: 100%;
+            height: 1px;
+            background: rgba(255,255,255,0.05);
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding-right: 10px;
+        }
+        
+        .grid-label {
+            font-size: 10px;
+            color: #666;
+            background: #0a0a0a;
+            padding: 0 4px;
+        }
+        
+        .chart-time-axis {
+            position: absolute;
+            bottom: 0;
+            left: 20px;
+            right: 20px;
+            height: 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid rgba(255,255,255,0.05);
+            padding-top: 10px;
+        }
+        
+        .time-label {
+            font-size: 10px;
+            color: #666;
+        }
+        
+        /* Trading Panel */
+        .panel-section {padding:20px; border-bottom:1px solid #222;}
+        .panel-title {font-size:16px; font-weight:600; margin-bottom:15px;}
+        
+        /* Order Type Tabs */
+        .order-tabs {display:flex; background:#222; border-radius:4px; padding:2px; margin-bottom:15px;}
+        .order-tab {flex:1; background:transparent; color:#999; border:none; padding:8px; border-radius:3px; font-size:12px; cursor:pointer; transition:all 0.2s;}
+        .order-tab:hover {background:#333;}
         .order-tab.active {background:#333; color:#fff;}
         
-        .trade-type-tabs {display:flex; margin-bottom:20px; gap:5px;}
-        .trade-tab {flex:1; padding:10px; border:none; border-radius:6px; cursor:pointer; font-weight:600; font-size:14px; transition:all 0.2s;}
-        .buy-tab {background:#00d4aa20; color:#00d4aa; border:1px solid #00d4aa40;}
-        .buy-tab.active {background:#00d4aa; color:#000;}
-        .sell-tab {background:#ff445520; color:#ff4455; border:1px solid #ff445540;}
-        .sell-tab.active {background:#ff4455; color:#fff;}
+        /* Trade Type Buttons */
+        .trade-buttons {display:flex; gap:8px; margin-bottom:15px;}
+        .trade-btn {flex:1; padding:10px; border:none; border-radius:4px; font-size:14px; font-weight:600; cursor:pointer; transition:all 0.2s;}
+        .buy-btn {background:#222; color:#00d4aa; border:1px solid #00d4aa;}
+        .buy-btn:hover {background:#00d4aa; color:#000;}
+        .buy-btn.active {background:#00d4aa; color:#000;}
+        .sell-btn {background:#222; color:#ff4455; border:1px solid #ff4455;}
+        .sell-btn:hover {background:#ff4455; color:#fff;}
+        .sell-btn.active {background:#ff4455; color:#fff;}
         
+        /* Balance Info */
+        .balance-info {background:#1a1a1a; padding:12px; border-radius:4px; margin-bottom:15px;}
+        .balance-row {display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;}
+        .balance-row:last-child {margin-bottom:0;}
+        .balance-label {color:#999;}
+        .balance-value {font-weight:600;}
+        
+        /* Form Elements */
         .form-group {margin-bottom:15px;}
-        .form-label {display:block; margin-bottom:5px; font-size:12px; color:#999; font-weight:600; text-transform:uppercase;}
-        .form-input {width:100%; background:#222; border:1px solid #333; color:#fff; padding:12px; border-radius:6px; font-size:14px;}
+        .form-label {display:block; font-size:11px; color:#999; text-transform:uppercase; margin-bottom:6px;}
+        .form-input {width:100%; background:#1a1a1a; border:1px solid #333; color:#fff; padding:10px; border-radius:4px; font-size:14px;}
         .form-input:focus {outline:none; border-color:#00d4aa;}
         
-        .balance-info {background:#1a1a1a; padding:12px; border-radius:6px; margin-bottom:15px;}
-        .balance-row {display:flex; justify-content:space-between; margin-bottom:5px; font-size:12px;}
-        .balance-label {color:#999;}
-        .balance-value {color:#fff; font-weight:600;}
+        /* Percentage Buttons */
+        .percentage-buttons {display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:8px;}
+        .pct-btn {background:#1a1a1a; color:#999; border:1px solid #333; padding:6px; border-radius:4px; font-size:11px; cursor:pointer; transition:all 0.2s;}
+        .pct-btn:hover {background:#333; color:#fff; border-color:#555;}
+        .pct-btn:active {background:#00d4aa; color:#000;}
         
-        .order-summary {background:#1a1a1a; padding:15px; border-radius:6px; margin-bottom:15px;}
-        .summary-row {display:flex; justify-content:space-between; margin-bottom:8px; font-size:12px;}
-        .summary-row:last-child {border-top:1px solid #333; padding-top:8px; font-weight:600;}
+        /* Order Summary */
+        .order-summary {background:#1a1a1a; padding:12px; border-radius:4px; margin-bottom:15px;}
+        .summary-row {display:flex; justify-content:space-between; font-size:12px; margin-bottom:6px;}
+        .summary-row:last-child {margin-bottom:0; border-top:1px solid #333; padding-top:6px; font-weight:600;}
+        .summary-label {color:#999;}
         
-        .execute-btn {width:100%; padding:15px; border:none; border-radius:6px; font-weight:700; font-size:14px; cursor:pointer; text-transform:uppercase; transition:all 0.2s;}
+        /* Execute Button */
+        .execute-btn {width:100%; padding:12px; border:none; border-radius:4px; font-size:14px; font-weight:600; text-transform:uppercase; cursor:pointer; transition:all 0.2s;}
         .execute-btn:disabled {opacity:0.5; cursor:not-allowed;}
-        .buy-btn {background:#00d4aa; color:#000;}
-        .buy-btn:hover:not(:disabled) {background:#00c499;}
-        .sell-btn {background:#ff4455; color:#fff;}
-        .sell-btn:hover:not(:disabled) {background:#ff3344;}
+        .execute-btn.buy {background:#00d4aa; color:#000;}
+        .execute-btn.buy:hover:not(:disabled) {background:#00b894;}
+        .execute-btn.sell {background:#ff4455; color:#fff;}
+        .execute-btn.sell:hover:not(:disabled) {background:#e63946;}
         
-        .order-book {padding:20px; border-bottom:1px solid #222;}
-        .trades-list {max-height:300px; overflow-y:auto;}
-        .trade-item {display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #1a1a1a; font-size:12px;}
+        /* Recent Trades */
+        .trades-list {max-height:200px; overflow-y:auto;}
+        .trade-item {display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #222; font-size:12px;}
+        .trade-item:last-child {border-bottom:none;}
         .trade-price {font-weight:600;}
         .trade-price.buy {color:#00d4aa;}
         .trade-price.sell {color:#ff4455;}
-        .trade-amount {color:#999;}
-        .trade-time {color:#666;}
+        .trade-amount, .trade-time {color:#999;}
         
-        .stats-panel {padding:20px;}
-        .stats-grid {display:grid; grid-template-columns:1fr 1fr; gap:15px;}
-        .stat-item {background:#1a1a1a; padding:12px; border-radius:6px; text-align:center;}
-        .stat-value {font-size:16px; font-weight:700; margin-bottom:4px;}
-        .stat-label {font-size:10px; color:#999; text-transform:uppercase;}
+        /* Alerts */
+        .alert {padding:12px; border-radius:4px; margin-bottom:15px; font-size:14px;}
+        .alert-success {background:rgba(0,212,170,0.1); color:#00d4aa; border:1px solid rgba(0,212,170,0.3);}
+        .alert-error {background:rgba(255,68,85,0.1); color:#ff4455; border:1px solid rgba(255,68,85,0.3);}
         
-        .progress-bar {width:100%; height:6px; background:#222; border-radius:3px; overflow:hidden; margin:10px 0;}
-        .progress-fill {height:100%; background:linear-gradient(90deg, #00d4aa, #00c499); transition:width 0.3s ease;}
+        /* Loading Animation */
+        .loading-indicator {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #00d4aa;
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            animation: spin 2s linear infinite;
+            display: inline-block;
+            margin-right: 5px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
         
-        .alert {padding:12px; border-radius:6px; margin-bottom:15px; font-size:14px;}
-        .alert-success {background:#00d4aa20; color:#00d4aa; border:1px solid #00d4aa40;}
-        .alert-error {background:#ff445520; color:#ff4455; border:1px solid #ff445540;}
+        /* Chart Animation */
+        @keyframes chartGlow {
+            0%, 100% { box-shadow: 0 0 5px rgba(0,212,170,0.3); }
+            50% { box-shadow: 0 0 20px rgba(0,212,170,0.6); }
+        }
         
-        .quick-amounts {display:grid; grid-template-columns:repeat(4, 1fr); gap:5px; margin-top:10px;}
-        .quick-amount {background:#222; color:#999; border:none; padding:6px; border-radius:4px; cursor:pointer; font-size:10px; font-weight:600;}
-        .quick-amount:hover {background:#333; color:#fff;}
+        .chart-bar.animated {
+            animation: chartGlow 2s ease-in-out infinite;
+        }
         
-        ::-webkit-scrollbar {width:6px;}
-        ::-webkit-scrollbar-track {background:#1a1a1a;}
-        ::-webkit-scrollbar-thumb {background:#333; border-radius:3px;}
-        ::-webkit-scrollbar-thumb:hover {background:#444;}
-        
+        /* Responsive */
         @media (max-width:768px) {
-            .trading-container {grid-template-columns:1fr; grid-template-rows:60px 1fr 400px;}
-            .sidebar {border-left:none; border-top:1px solid #222;}
+            .trading-app {grid-template-columns:1fr; grid-template-rows:1fr auto;}
+            .chart-area {height:60vh;}
+            .trading-panel {border-left:none; border-top:1px solid #222; height:auto; max-height:40vh;}
         }
     </style>
 </head>
 <body>
-    <div class="trading-container">
-        <div class="header">
-            <div class="token-info">
-                <?php if ($token['image_url']): ?>
-                    <img src="../<?php echo htmlspecialchars($token['image_url']); ?>" 
-                         alt="<?php echo htmlspecialchars($token['name']); ?>" class="token-image">
-                <?php else: ?>
-                    <div class="token-image">
-                        <?php echo substr($token['symbol'], 0, 2); ?>
+    <div class="trading-app">
+        <!-- Chart Area -->
+        <div class="chart-area">
+            <div class="app-header">
+                <div class="token-info">
+                    <?php if ($token['image_url']): ?>
+                        <div class="token-icon"><img src="../<?php echo htmlspecialchars($token['image_url']); ?>" alt="<?php echo htmlspecialchars($token['symbol']); ?>"></div>
+                    <?php else: ?>
+                        <div class="token-icon"><?php echo substr($token['symbol'], 0, 2); ?></div>
+                    <?php endif; ?>
+                    <div>
+                        <div class="token-name"><?php echo htmlspecialchars($token['name']); ?></div>
+                        <div class="token-symbol"><?php echo htmlspecialchars($token['symbol']); ?></div>
                     </div>
-                <?php endif; ?>
-                <div class="token-details">
-                    <h1><?php echo htmlspecialchars($token['name']); ?></h1>
-                    <div class="token-symbol"><?php echo htmlspecialchars($token['symbol']); ?></div>
+                </div>
+                <div class="price-display">
+                    <div class="current-price" id="current-price"><?php echo number_format($token['current_price'], 8); ?> TRX</div>
+                    <div class="price-change <?php echo $priceChange24h >= 0 ? 'positive' : 'negative'; ?>" id="price-change">
+                        <?php echo ($priceChange24h >= 0 ? '+' : '') . number_format($priceChange24h, 2); ?>%
+                        <?php if ($priceChangeAbs != 0): ?>
+                            (<?php echo ($priceChangeAbs >= 0 ? '+' : '') . number_format($priceChangeAbs, 8); ?> TRX)
+                        <?php endif; ?>
+                    </div>
+                    <div style="font-size: 10px; color: #666; margin-top: 2px;" id="trades-24h">
+                        <?php echo isset($priceData['trades_24h']) ? $priceData['trades_24h'] : 0; ?> trades (24h)
+                    </div>
                 </div>
             </div>
             
-            <div class="price-info">
-                <div class="current-price"><?php echo number_format($token['current_price'], 8); ?> TRX</div>
-                <div class="price-change <?php echo $price_change_24h >= 0 ? 'positive' : 'negative'; ?>">
-                    <?php echo ($price_change_24h >= 0 ? '+' : '') . number_format($price_change_24h, 2); ?>%
+            <div class="chart-controls">
+                <div class="time-intervals">
+                    <button class="interval-btn active" data-interval="1m">1m</button>
+                    <button class="interval-btn" data-interval="5m">5m</button>
+                    <button class="interval-btn" data-interval="15m">15m</button>
+                    <button class="interval-btn" data-interval="1h">1h</button>
+                    <button class="interval-btn" data-interval="4h">4h</button>
+                    <button class="interval-btn" data-interval="1d">1d</button>
                 </div>
             </div>
             
-            <div class="nav-actions">
-                <a href="trade.php" class="back-btn">← Back to Trade</a>
-            </div>
-        </div>
-        
-        <div class="main-content">
-            <div class="chart-section">
-                <div class="chart-controls">
-                    <div class="time-intervals">
-                        <button class="interval-btn active" data-interval="1m">1m</button>
-                        <button class="interval-btn" data-interval="5m">5m</button>
-                        <button class="interval-btn" data-interval="15m">15m</button>
-                        <button class="interval-btn" data-interval="1h">1h</button>
-                        <button class="interval-btn" data-interval="4h">4h</button>
-                        <button class="interval-btn" data-interval="1d">1d</button>
+            <div class="chart-container">
+                <div class="css-chart-wrapper">
+                    <div class="chart-grid" id="chart-grid">
+                        <!-- Grid lines will be added by JavaScript -->
+                    </div>
+                    <div class="css-chart" id="css-chart">
+                        <!-- Chart bars will be added by JavaScript -->
+                    </div>
+                    <div class="chart-time-axis" id="chart-time-axis">
+                        <!-- Time labels will be added by JavaScript -->
                     </div>
                 </div>
-                
-                <div class="chart-container">
-                    <canvas id="priceChart"></canvas>
-                </div>
             </div>
         </div>
         
-        <div class="sidebar">
+        <!-- Trading Panel -->
+        <div class="trading-panel">
             <?php if (!empty($error)): ?>
                 <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
             <?php endif; ?>
@@ -513,420 +603,562 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['trade_action'])) {
                 <div class="alert alert-success"><?php echo htmlspecialchars($success); ?></div>
             <?php endif; ?>
             
-            <div class="trading-panel">
-                <div class="panel-title">Place Order</div>
+            <div class="panel-section">
+                <h2 class="panel-title">Place Order</h2>
                 
-                <form method="POST" id="trading-form">
-                    <input type="hidden" name="trade_action" id="trade_action" value="buy">
-                    
-                    <div class="order-type-tabs">
-                        <button type="button" class="order-tab active" data-type="market">Market</button>
-                        <button type="button" class="order-tab" data-type="limit">Limit</button>
+                <div class="order-tabs">
+                    <button type="button" class="order-tab active" data-type="market">Market</button>
+                    <button type="button" class="order-tab" data-type="limit">Limit</button>
+                </div>
+                
+                <div class="trade-buttons">
+                    <button type="button" class="trade-btn buy-btn active" data-action="buy">Buy</button>
+                    <button type="button" class="trade-btn sell-btn" data-action="sell">Sell</button>
+                </div>
+                
+                <div class="balance-info">
+                    <div class="balance-row">
+                        <span class="balance-label">TRX Balance:</span>
+                        <span class="balance-value" id="trx-balance"><?php echo number_format($wallet['balance'], 2); ?> TRX</span>
                     </div>
-                    
-                    <div class="trade-type-tabs">
-                        <button type="button" class="trade-tab buy-tab active" data-action="buy">Buy</button>
-                        <button type="button" class="trade-tab sell-tab" data-action="sell">Sell</button>
+                    <div class="balance-row">
+                        <span class="balance-label">Token Balance:</span>
+                        <span class="balance-value" id="token-balance"><?php echo number_format($token['user_balance'], 2); ?> <?php echo htmlspecialchars($token['symbol']); ?></span>
                     </div>
-                    
-                    <div class="balance-info">
-                        <div class="balance-row">
-                            <span class="balance-label">TRX Balance:</span>
-                            <span class="balance-value" id="trx-balance"><?php echo number_format($wallet['balance'], 4); ?> TRX</span>
-                        </div>
-                        <div class="balance-row">
-                            <span class="balance-label">Token Balance:</span>
-                            <span class="balance-value" id="token-balance"><?php echo number_format($token['user_balance'], 2); ?> <?php echo $token['symbol']; ?></span>
-                        </div>
-                    </div>
-                    
-                    <div class="form-group" id="limit-price-group" style="display: none;">
-                        <label class="form-label">Limit Price (TRX)</label>
-                        <input type="number" name="limit_price" id="limit-price" class="form-input" step="0.00000001" placeholder="0.00000000">
-                    </div>
+                </div>
+                
+                <form method="POST" id="trade-form">
+                    <input type="hidden" name="trade_action" id="trade-action" value="buy">
+                    <input type="hidden" name="order_type" id="order-type" value="market">
                     
                     <div class="form-group">
                         <label class="form-label">Amount (Tokens)</label>
-                        <input type="number" name="amount" id="token-amount" class="form-input" step="0.01" min="0.01" required placeholder="0.00">
-                        <div class="quick-amounts">
-                            <button type="button" class="quick-amount" data-percent="25">25%</button>
-                            <button type="button" class="quick-amount" data-percent="50">50%</button>
-                            <button type="button" class="quick-amount" data-percent="75">75%</button>
-                            <button type="button" class="quick-amount" data-percent="100">Max</button>
+                        <input type="number" name="amount" id="amount-input" class="form-input" step="0.01" min="0.01" placeholder="0.00" required>
+                        <div class="percentage-buttons">
+                            <button type="button" class="pct-btn" data-percent="25">25%</button>
+                            <button type="button" class="pct-btn" data-percent="50">50%</button>
+                            <button type="button" class="pct-btn" data-percent="75">75%</button>
+                            <button type="button" class="pct-btn" data-percent="100">Max</button>
                         </div>
                     </div>
                     
-                    <input type="hidden" name="order_type" id="order_type" value="market">
+                    <div class="form-group" id="limit-price-group" style="display:none;">
+                        <label class="form-label">Limit Price (TRX)</label>
+                        <input type="number" name="limit_price" id="limit-price" class="form-input" step="0.00000001" min="0.00000001" placeholder="0.00000000">
+                    </div>
                     
                     <div class="order-summary">
                         <div class="summary-row">
-                            <span>Price per token:</span>
-                            <span id="summary-price"><?php echo number_format($token['current_price'], 8); ?> TRX</span>
+                            <span class="summary-label">Price per token:</span>
+                            <span id="price-per-token"><?php echo number_format($token['current_price'], 8); ?> TRX</span>
                         </div>
                         <div class="summary-row">
-                            <span>Trading fee:</span>
-                            <span><?php echo $trading_fee; ?> TRX</span>
+                            <span class="summary-label">Trading fee:</span>
+                            <span><?php echo number_format($tradingFee, 2); ?> TRX</span>
                         </div>
                         <div class="summary-row">
-                            <span id="total-label">Total:</span>
-                            <span id="summary-total">0.0000 TRX</span>
+                            <span class="summary-label" id="total-label">Total:</span>
+                            <span id="total-amount">0.00000000 TRX</span>
                         </div>
                     </div>
                     
-                    <button type="submit" class="execute-btn buy-btn" id="execute-btn">
-                        Buy <?php echo $token['symbol']; ?>
+                    <button type="submit" class="execute-btn buy" id="execute-btn">
+                        Buy <?php echo strtoupper(htmlspecialchars($token['symbol'])); ?>
                     </button>
                 </form>
             </div>
             
-            <div class="order-book">
-                <div class="panel-title">Recent Trades</div>
-                <div class="trades-list">
-                    <?php if (empty($recent_trades)): ?>
+            <div class="panel-section">
+                <h2 class="panel-title">Recent Trades</h2>
+                <div class="trades-list" id="trades-list">
+                    <?php if (empty($recentTrades)): ?>
                         <div style="text-align:center; color:#999; padding:20px;">No trades yet</div>
                     <?php else: ?>
-                        <?php foreach ($recent_trades as $trade): ?>
+                        <?php foreach ($recentTrades as $trade): ?>
                             <div class="trade-item">
                                 <span class="trade-price <?php echo $trade['transaction_type']; ?>">
                                     <?php echo number_format($trade['price_per_token'], 8); ?>
                                 </span>
                                 <span class="trade-amount"><?php echo number_format($trade['token_amount'], 2); ?></span>
-                                <span class="trade-time"><?php echo date('H:i', strtotime($trade['created_at'])); ?></span>
+                                <span class="trade-time"><?php echo date('H:i:s', strtotime($trade['created_at'])); ?></span>
                             </div>
                         <?php endforeach; ?>
                     <?php endif; ?>
-                </div>
-            </div>
-            
-            <div class="stats-panel">
-                <div class="panel-title">Token Stats</div>
-                
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: <?php echo $token['current_progress']; ?>%"></div>
-                </div>
-                <div style="text-align: center; font-size: 12px; color: #999; margin-bottom: 15px;">
-                    Bonding Curve: <?php echo number_format($token['current_progress'], 1); ?>%
-                </div>
-                
-                <div class="stats-grid">
-                    <div class="stat-item">
-                        <div class="stat-value"><?php echo number_format($stats_24h['volume_24h'] ?? 0, 0); ?> TRX</div>
-                        <div class="stat-label">24h Volume</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-value"><?php echo $token['total_transactions']; ?></div>
-                        <div class="stat-label">Transactions</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-value"><?php echo number_format($stats_24h['high_24h'] ?? $token['current_price'], 8); ?></div>
-                        <div class="stat-label">24h High</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-value"><?php echo number_format($stats_24h['low_24h'] ?? $token['current_price'], 8); ?></div>
-                        <div class="stat-label">24h Low</div>
-                    </div>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        // Chart configuration
-        const ctx = document.getElementById('priceChart').getContext('2d');
-        const chartData = <?php echo json_encode($chart_data); ?>;
-        
-        // Process chart data
-        const processedData = chartData.map(item => ({
-            x: new Date(item.time_bucket),
-            y: parseFloat(item.avg_price)
-        }));
-        
-        // Add current price as latest point if no data
-        if (processedData.length === 0) {
-            processedData.push({
-                x: new Date(),
-                y: <?php echo $token['current_price']; ?>
-            });
-        }
-        
-        const chart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                datasets: [{
-                    label: 'Price',
-                    data: processedData,
-                    borderColor: '#00d4aa',
-                    backgroundColor: 'rgba(0, 212, 170, 0.1)',
-                    borderWidth: 2,
-                    fill: true,
-                    tension: 0.4,
-                    pointRadius: 0,
-                    pointHoverRadius: 6
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                    legend: {
-                        display: false
-                    }
-                },
-                scales: {
-                    x: {
-                        type: 'time',
-                        time: {
-                            unit: 'minute',
-                            displayFormats: {
-                                minute: 'HH:mm'
-                            }
-                        },
-                        grid: {
-                            color: '#333'
-                        },
-                        ticks: {
-                            color: '#999'
-                        }
-                    },
-                    y: {
-                        grid: {
-                            color: '#333'
-                        },
-                        ticks: {
-                            color: '#999',
-                            callback: function(value) {
-                                return value.toFixed(8) + ' TRX';
-                            }
-                        }
-                    }
-                },
-                interaction: {
-                    intersect: false,
-                    mode: 'index'
-                }
-            }
-        });
-        
-        // Trading form functionality
-        const tradeActionInput = document.getElementById('trade_action');
-        const executeBtn = document.getElementById('execute-btn');
-        const orderTypeInput = document.getElementById('order_type');
-        const limitPriceGroup = document.getElementById('limit-price-group');
-        const tokenAmountInput = document.getElementById('token-amount');
-        const limitPriceInput = document.getElementById('limit-price');
-        const totalLabel = document.getElementById('total-label');
-        
-        // Current token data
-        const currentPrice = <?php echo $token['current_price']; ?>;
-        const tradingFee = <?php echo $trading_fee; ?>;
+        // Global variables
+        let currentPrice = <?php echo $token['current_price']; ?>;
+        const tradingFee = <?php echo $tradingFee; ?>;
         let userTrxBalance = <?php echo $wallet['balance']; ?>;
         let userTokenBalance = <?php echo $token['user_balance']; ?>;
         const tokenSymbol = '<?php echo $token['symbol']; ?>';
+        let priceChange24h = <?php echo $priceChange24h; ?>;
+        let trades24h = <?php echo isset($priceData['trades_24h']) ? $priceData['trades_24h'] : 0; ?>;
+        let currentInterval = '1m';
+        let chartData = [];
+        let priceUpdateInterval;
+        let chartUpdateInterval;
         
-        // Trade type tabs - FIXED DIVISION BY ZERO
-        document.querySelectorAll('.trade-tab').forEach(tab => {
-            tab.addEventListener('click', function() {
-                document.querySelectorAll('.trade-tab').forEach(t => t.classList.remove('active'));
-                this.classList.add('active');
-                
-                const action = this.dataset.action;
-                tradeActionInput.value = action;
-                
-                if (action === 'buy') {
-                    executeBtn.textContent = 'Buy ' + tokenSymbol;
-                    executeBtn.className = 'execute-btn buy-btn';
-                    totalLabel.textContent = 'Total Cost:';
-                } else {
-                    executeBtn.textContent = 'Sell ' + tokenSymbol;
-                    executeBtn.className = 'execute-btn sell-btn';
-                    totalLabel.textContent = 'You Receive:';
-                }
-                
-                // Clear amount and update summary
-                tokenAmountInput.value = '';
-                updateSummary();
-            });
-        });
+        // DOM elements
+        const tradeForm = document.getElementById('trade-form');
+        const tradeAction = document.getElementById('trade-action');
+        const orderType = document.getElementById('order-type');
+        const amountInput = document.getElementById('amount-input');
+        const limitPriceInput = document.getElementById('limit-price');
+        const limitPriceGroup = document.getElementById('limit-price-group');
+        const pricePerToken = document.getElementById('price-per-token');
+        const totalAmount = document.getElementById('total-amount');
+        const totalLabel = document.getElementById('total-label');
+        const executeBtn = document.getElementById('execute-btn');
+        const currentPriceDisplay = document.getElementById('current-price');
+        const priceChangeDisplay = document.getElementById('price-change');
+        const trades24hDisplay = document.getElementById('trades-24h');
+        const trxBalanceDisplay = document.getElementById('trx-balance');
+        const tokenBalanceDisplay = document.getElementById('token-balance');
+        const tradesListDisplay = document.getElementById('trades-list');
+        const cssChart = document.getElementById('css-chart');
+        const chartGrid = document.getElementById('chart-grid');
+        const chartTimeAxis = document.getElementById('chart-time-axis');
         
-        // Order type tabs
-        document.querySelectorAll('.order-tab').forEach(tab => {
-            tab.addEventListener('click', function() {
-                document.querySelectorAll('.order-tab').forEach(t => t.classList.remove('active'));
-                this.classList.add('active');
-                
-                const type = this.dataset.type;
-                orderTypeInput.value = type;
-                
-                if (type === 'limit') {
-                    limitPriceGroup.style.display = 'block';
-                    limitPriceInput.value = currentPrice.toFixed(8);
-                } else {
-                    limitPriceGroup.style.display = 'none';
-                    limitPriceInput.value = '';
-                }
-                
-                updateSummary();
-            });
-        });
-        
-        // Quick amount buttons - FIXED FOR SELL
-        document.querySelectorAll('.quick-amount').forEach(btn => {
-            btn.addEventListener('click', function(e) {
-                e.preventDefault();
-                const percent = parseInt(this.dataset.percent);
-                const action = tradeActionInput.value;
-                
-                let maxAmount = 0;
-                if (action === 'buy') {
-                    // For buy: calculate max tokens based on TRX balance minus fee
-                    const price = getEffectivePrice();
-                    if (price > 0) {
-                        maxAmount = Math.max(0, (userTrxBalance - tradingFee) / price);
-                    }
-                } else {
-                    // For sell: use token balance
-                    maxAmount = userTokenBalance;
-                }
-                
-                const amount = (maxAmount * percent / 100).toFixed(2);
-                tokenAmountInput.value = amount;
-                updateSummary();
-            });
-        });
-        
-        // Amount input listener
-        tokenAmountInput.addEventListener('input', updateSummary);
-        if (limitPriceInput) {
-            limitPriceInput.addEventListener('input', updateSummary);
-        }
-        
-        function getEffectivePrice() {
-            const orderType = orderTypeInput.value;
-            const limitPrice = parseFloat(limitPriceInput?.value) || 0;
+        // Generate realistic chart data
+        function generateChartData(interval, points = 50) {
+            const data = [];
+            const now = new Date();
+            const basePrice = currentPrice;
             
-            return (orderType === 'limit' && limitPrice > 0) ? limitPrice : currentPrice;
-        }
-        
-        function updateSummary() {
-            const amount = parseFloat(tokenAmountInput.value) || 0;
-            const price = getEffectivePrice();
-            const action = tradeActionInput.value;
+            // Interval multipliers in minutes
+            const intervalMinutes = {
+                '1m': 1, '5m': 5, '15m': 15, 
+                '1h': 60, '4h': 240, '1d': 1440
+            };
             
-            // Prevent division by zero
-            if (price <= 0) {
-                document.getElementById('summary-price').textContent = '0.00000000 TRX';
-                document.getElementById('summary-total').textContent = '0.0000 TRX';
-                executeBtn.disabled = true;
-                executeBtn.title = 'Invalid price';
-                return;
+            const minutes = intervalMinutes[interval] || 1;
+            
+            for (let i = points - 1; i >= 0; i--) {
+                const time = new Date(now.getTime() - i * minutes * 60000);
+                
+                // Generate realistic price with trend and volatility
+                const trend = Math.sin(i / 10) * 0.001; // Slight trend
+                const volatility = (Math.random() - 0.5) * 0.02; // 2% volatility
+                const price = basePrice * (1 + trend + volatility);
+                
+                data.push({
+                    time: time,
+                    price: Math.max(price, basePrice * 0.5), // Prevent negative prices
+                    volume: Math.random() * 1000 + 100
+                });
             }
             
-            document.getElementById('summary-price').textContent = price.toFixed(8) + ' TRX';
+            return data;
+        }
+        
+        // Create CSS chart
+        function createChart(data) {
+            if (!data || data.length === 0) return;
+            
+            // Clear existing chart
+            cssChart.innerHTML = '';
+            chartGrid.innerHTML = '';
+            chartTimeAxis.innerHTML = '';
+            
+            // Find min and max prices for scaling
+            const prices = data.map(item => item.price);
+            const minPrice = Math.min(...prices);
+            const maxPrice = Math.max(...prices);
+            const priceRange = maxPrice - minPrice;
+            
+            // Create grid lines
+            for (let i = 0; i < 5; i++) {
+                const gridLine = document.createElement('div');
+                gridLine.className = 'grid-line';
+                gridLine.style.top = `${i * 25}%`;
+                
+                const gridLabel = document.createElement('span');
+                gridLabel.className = 'grid-label';
+                const price = maxPrice - (i * (priceRange / 4));
+                gridLabel.textContent = price.toFixed(8);
+                
+                gridLine.appendChild(gridLabel);
+                chartGrid.appendChild(gridLine);
+            }
+            
+            // Create chart bars
+            data.forEach((item, index) => {
+                const price = item.price;
+                const prevPrice = index > 0 ? data[index - 1].price : price;
+                const height = priceRange > 0 ? ((price - minPrice) / priceRange) * 100 : 50;
+                
+                const bar = document.createElement('div');
+                bar.className = `chart-bar ${price >= prevPrice ? 'up' : 'down'}`;
+                bar.style.height = `${Math.max(2, height)}%`;
+                bar.setAttribute('data-price', price.toFixed(8) + ' TRX');
+                
+                // Add animation delay
+                bar.style.animationDelay = `${index * 0.05}s`;
+                
+                cssChart.appendChild(bar);
+            });
+            
+            // Create time labels
+            const timeLabels = [];
+            const labelCount = 5;
+            for (let i = 0; i < labelCount; i++) {
+                const index = Math.floor((data.length - 1) * i / (labelCount - 1));
+                if (data[index]) {
+                    timeLabels.push(data[index].time.toLocaleTimeString());
+                }
+            }
+            
+            timeLabels.forEach(label => {
+                const timeLabel = document.createElement('div');
+                timeLabel.className = 'time-label';
+                timeLabel.textContent = label;
+                chartTimeAxis.appendChild(timeLabel);
+            });
+        }
+        
+        // Fetch real chart data from API
+        async function fetchChartData(interval) {
+            try {
+                const response = await fetch(`api/chart.php?token_id=<?php echo $token_id; ?>&interval=${interval}&_t=${Date.now()}`);
+                const result = await response.json();
+                
+                if (result.success && result.data && result.data.length > 0) {
+                    // Convert API data to our format
+                    const convertedData = result.data.map(item => ({
+                        time: new Date(item.time),
+                        price: item.close || item.price,
+                        volume: item.volume || 0
+                    }));
+                    
+                    // Update price change if available
+                    if (result.price_change_24h !== undefined) {
+                        updatePriceChangeDisplay(result.price_change_24h);
+                    }
+                    
+                    // Update trades count
+                    if (result.trades_24h !== undefined) {
+                        trades24h = result.trades_24h;
+                        trades24hDisplay.textContent = trades24h + ' trades (24h)';
+                    }
+                    
+                    return convertedData;
+                }
+                
+                return null;
+            } catch (error) {
+                console.error('Chart API error:', error);
+                return null;
+            }
+        }
+        
+        // Update chart with new interval
+        async function updateChart(interval) {
+            currentInterval = interval;
+            
+            // Try to fetch real data first
+            let data = await fetchChartData(interval);
+            
+            // If no real data, generate sample data
+            if (!data) {
+                data = generateChartData(interval);
+            }
+            
+            chartData = data;
+            createChart(data);
+        }
+        
+        // Update price change display
+        function updatePriceChangeDisplay(change) {
+            priceChange24h = change;
+            const isPositive = change >= 0;
+            priceChangeDisplay.className = `price-change ${isPositive ? 'positive' : 'negative'}`;
+            priceChangeDisplay.textContent = `${isPositive ? '+' : ''}${change.toFixed(2)}%`;
+        }
+        
+        // Calculate total based on amount and action
+        function updateTotal() {
+            const amount = parseFloat(amountInput.value) || 0;
+            const action = tradeAction.value;
+            let price = currentPrice;
+            
+            // Use limit price if applicable
+            if (orderType.value === 'limit') {
+                const limitPrice = parseFloat(limitPriceInput.value) || 0;
+                if (limitPrice > 0) {
+                    price = limitPrice;
+                }
+            }
+            
+            pricePerToken.textContent = price.toFixed(8) + ' TRX';
             
             if (action === 'buy') {
-                const totalCost = (amount * price) + tradingFee;
-                document.getElementById('summary-total').textContent = totalCost.toFixed(4) + ' TRX';
+                const total = (amount * price) + tradingFee;
+                totalAmount.textContent = total.toFixed(8) + ' TRX';
+                totalLabel.textContent = 'Total:';
                 
                 // Disable button if insufficient balance
-                if (amount <= 0) {
-                    executeBtn.disabled = true;
-                    executeBtn.title = 'Enter amount';
-                } else if (totalCost > userTrxBalance) {
-                    executeBtn.disabled = true;
-                    executeBtn.title = 'Insufficient TRX balance';
-                } else {
-                    executeBtn.disabled = false;
-                    executeBtn.title = '';
-                }
+                executeBtn.disabled = amount <= 0 || total > userTrxBalance;
             } else {
-                // SELL - FIXED CALCULATION WITH DIVISION BY ZERO PROTECTION
-                if (amount <= 0) {
-                    document.getElementById('summary-total').textContent = '0.0000 TRX';
-                    executeBtn.disabled = true;
-                    executeBtn.title = 'Enter amount';
-                } else {
-                    const trxReceived = amount * price;
-                    
-                    if (trxReceived <= tradingFee) {
-                        const minTokens = Math.ceil((tradingFee + 0.0001) / price);
-                        document.getElementById('summary-total').textContent = '0.0000 TRX (Fee > Value)';
-                        executeBtn.disabled = true;
-                        executeBtn.title = 'Minimum ' + minTokens + ' tokens required';
-                    } else {
-                        const totalAfterFee = trxReceived - tradingFee;
-                        document.getElementById('summary-total').textContent = totalAfterFee.toFixed(4) + ' TRX';
-                        
-                        // Disable button if insufficient token balance
-                        if (amount > userTokenBalance) {
-                            executeBtn.disabled = true;
-                            executeBtn.title = 'Insufficient token balance';
-                        } else {
-                            executeBtn.disabled = false;
-                            executeBtn.title = '';
-                        }
-                    }
-                }
+                const received = Math.max(0, (amount * price) - tradingFee);
+                totalAmount.textContent = received.toFixed(8) + ' TRX';
+                totalLabel.textContent = 'You Receive:';
+                
+                // Disable button if insufficient token balance or amount too small
+                executeBtn.disabled = amount <= 0 || amount > userTokenBalance || received <= 0;
             }
         }
         
-        // Time interval buttons
-        document.querySelectorAll('.interval-btn').forEach(btn => {
-            btn.addEventListener('click', function() {
-                document.querySelectorAll('.interval-btn').forEach(b => b.classList.remove('active'));
-                this.classList.add('active');
+        // Real-time price updates
+        async function updatePriceData() {
+            try {
+                const response = await fetch(`api/trades.php?token_id=<?php echo $token_id; ?>&limit=1&_t=${Date.now()}`);
+                const result = await response.json();
                 
-                console.log('Selected interval:', this.dataset.interval);
+                if (result.success && result.trades && result.trades.length > 0) {
+                    const latestTrade = result.trades[0];
+                    const newPrice = parseFloat(latestTrade.price_per_token);
+                    
+                    // Update price display
+                    currentPrice = newPrice;
+                    currentPriceDisplay.textContent = newPrice.toFixed(8) + ' TRX';
+                    
+                    // Update price change if available
+                    if (result.stats && result.stats.price_change_24h !== undefined) {
+                        updatePriceChangeDisplay(result.stats.price_change_24h);
+                    }
+                    
+                    // Update trades count
+                    if (result.stats && result.stats.total_trades !== undefined) {
+                        trades24h = result.stats.total_trades;
+                        trades24hDisplay.textContent = trades24h + ' trades (24h)';
+                    }
+                    
+                    // Add new data point to chart
+                    if (chartData.length > 0) {
+                        const lastDataPoint = chartData[chartData.length - 1];
+                        const now = new Date();
+                        
+                        // Add new point if enough time has passed
+                        if (now - lastDataPoint.time > 60000) { // 1 minute
+                            chartData.push({
+                                time: now,
+                                price: newPrice,
+                                volume: Math.random() * 1000 + 100
+                            });
+                            
+                            // Keep only last 50 points
+                            if (chartData.length > 50) {
+                                chartData.shift();
+                            }
+                            
+                            createChart(chartData);
+                        }
+                    }
+                    
+                    // Update total calculation
+                    updateTotal();
+                }
+            } catch (error) {
+                console.error('Price update failed:', error);
+            }
+        }
+        
+        // Update recent trades list
+        async function updateTradesList() {
+            try {
+                const response = await fetch(`api/trades.php?token_id=<?php echo $token_id; ?>&limit=20&_t=${Date.now()}`);
+                const result = await response.json();
+                
+                if (result.success && result.trades) {
+                    let tradesHTML = '';
+                    
+                    if (result.trades.length === 0) {
+                        tradesHTML = '<div style="text-align:center; color:#999; padding:20px;">No trades yet</div>';
+                    } else {
+                        result.trades.forEach(trade => {
+                            const time = new Date(trade.created_at).toLocaleTimeString();
+                            tradesHTML += `
+                                <div class="trade-item">
+                                    <span class="trade-price ${trade.transaction_type}">
+                                        ${parseFloat(trade.price_per_token).toFixed(8)}
+                                    </span>
+                                    <span class="trade-amount">${parseFloat(trade.token_amount).toFixed(2)}</span>
+                                    <span class="trade-time">${time}</span>
+                                </div>
+                            `;
+                        });
+                    }
+                    
+                    tradesListDisplay.innerHTML = tradesHTML;
+                }
+            } catch (error) {
+                console.error('Trades list update failed:', error);
+            }
+        }
+        
+        // Event listeners
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize chart
+            updateChart(currentInterval);
+            
+            // Order type tabs
+            document.querySelectorAll('.order-tab').forEach(tab => {
+                tab.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    
+                    document.querySelectorAll('.order-tab').forEach(t => t.classList.remove('active'));
+                    this.classList.add('active');
+                    
+                    const type = this.dataset.type;
+                    orderType.value = type;
+                    
+                    if (type === 'limit') {
+                        limitPriceGroup.style.display = 'block';
+                        limitPriceInput.value = currentPrice.toFixed(8);
+                    } else {
+                        limitPriceGroup.style.display = 'none';
+                    }
+                    
+                    updateTotal();
+                });
             });
-        });
-        
-        // Form validation - ENHANCED WITH DIVISION BY ZERO PROTECTION
-        document.getElementById('trading-form').addEventListener('submit', function(e) {
-            const amount = parseFloat(tokenAmountInput.value) || 0;
-            const action = tradeActionInput.value;
-            const price = getEffectivePrice();
             
-            if (amount <= 0) {
-                e.preventDefault();
-                alert('Please enter a valid amount');
-                return;
+            // Trade action buttons
+            document.querySelectorAll('.trade-btn').forEach(btn => {
+                btn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    
+                    document.querySelectorAll('.trade-btn').forEach(b => b.classList.remove('active'));
+                    this.classList.add('active');
+                    
+                    const action = this.dataset.action;
+                    tradeAction.value = action;
+                    
+                    if (action === 'buy') {
+                        executeBtn.textContent = 'Buy ' + tokenSymbol.toUpperCase();
+                        executeBtn.className = 'execute-btn buy';
+                    } else {
+                        executeBtn.textContent = 'Sell ' + tokenSymbol.toUpperCase();
+                        executeBtn.className = 'execute-btn sell';
+                    }
+                    
+                    updateTotal();
+                });
+            });
+            
+            // Percentage buttons
+            document.querySelectorAll('.pct-btn').forEach(btn => {
+                btn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    
+                    const percent = parseInt(this.dataset.percent);
+                    const action = tradeAction.value;
+                    
+                    let maxAmount = 0;
+                    if (action === 'buy') {
+                        // For buy: calculate max tokens based on TRX balance
+                        const price = currentPrice;
+                        if (price > 0) {
+                            maxAmount = Math.max(0, (userTrxBalance - tradingFee) / price);
+                        }
+                    } else {
+                        // For sell: use token balance
+                        maxAmount = userTokenBalance;
+                    }
+                    
+                    const amount = (maxAmount * percent / 100);
+                    amountInput.value = amount.toFixed(2);
+                    updateTotal();
+                    
+                    // Visual feedback
+                    this.style.background = '#00d4aa';
+                    this.style.color = '#000';
+                    setTimeout(() => {
+                        this.style.background = '';
+                        this.style.color = '';
+                    }, 200);
+                });
+            });
+            
+            // Amount input
+            amountInput.addEventListener('input', updateTotal);
+            
+            // Limit price input
+            if (limitPriceInput) {
+                limitPriceInput.addEventListener('input', updateTotal);
             }
             
-            if (price <= 0) {
-                e.preventDefault();
-                alert('Invalid price. Please try again.');
-                return;
-            }
+            // Time interval buttons
+            document.querySelectorAll('.interval-btn').forEach(btn => {
+                btn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    
+                    document.querySelectorAll('.interval-btn').forEach(b => b.classList.remove('active'));
+                    this.classList.add('active');
+                    
+                    const interval = this.dataset.interval;
+                    updateChart(interval);
+                });
+            });
             
-            if (action === 'buy') {
-                const totalCost = (amount * price) + tradingFee;
-                if (totalCost > userTrxBalance) {
+            // Form submission
+            tradeForm.addEventListener('submit', function(e) {
+                const amount = parseFloat(amountInput.value) || 0;
+                if (amount <= 0) {
                     e.preventDefault();
-                    alert('Insufficient TRX balance');
-                    return;
-                }
-            } else {
-                if (amount > userTokenBalance) {
-                    e.preventDefault();
-                    alert('Insufficient token balance');
-                    return;
+                    alert('Please enter a valid amount');
+                    return false;
                 }
                 
-                const trxReceived = amount * price;
-                if (trxReceived <= tradingFee) {
-                    e.preventDefault();
-                    alert('Amount too small to cover trading fee');
-                    return;
-                }
-            }
+                // Show loading state
+                executeBtn.disabled = true;
+                executeBtn.innerHTML = '<div class="loading-indicator"></div> Processing...';
+            });
+            
+            // Initialize total calculation
+            updateTotal();
+            
+            // Start real-time updates
+            priceUpdateInterval = setInterval(updatePriceData, 10000); // Every 10 seconds
+            setTimeout(updateTradesList, 5000); // Update trades list after 5 seconds
+            setInterval(updateTradesList, 30000); // Then every 30 seconds
+            
+            // Auto-refresh chart data every 30 seconds
+            chartUpdateInterval = setInterval(() => {
+                updateChart(currentInterval);
+            }, 30000);
         });
         
-        // Initialize summary
-        updateSummary();
-        
-        // Auto-refresh data every 30 seconds
-        setInterval(function() {
-            console.log('Auto-refresh...');
-        }, 30000);
+        // Cleanup intervals when page unloads
+        window.addEventListener('beforeunload', function() {
+            if (priceUpdateInterval) clearInterval(priceUpdateInterval);
+            if (chartUpdateInterval) clearInterval(chartUpdateInterval);
+        });
+
+        // Handle visibility change to pause/resume updates
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                // Page is hidden, clear intervals
+                if (priceUpdateInterval) clearInterval(priceUpdateInterval);
+                if (chartUpdateInterval) clearInterval(chartUpdateInterval);
+            } else {
+                // Page is visible, restart intervals
+                priceUpdateInterval = setInterval(updatePriceData, 10000);
+                chartUpdateInterval = setInterval(() => {
+                    updateChart(currentInterval);
+                }, 30000);
+                
+                // Immediate update when page becomes visible
+                updatePriceData();
+                updateTradesList();
+            }
+        });
     </script>
 </body>
 </html>

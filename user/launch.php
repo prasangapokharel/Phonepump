@@ -8,21 +8,221 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
+// Include Composer autoloader for Guzzle and Symfony Cache
+require_once "../vendor/autoload.php";
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\RequestException;
+use Symfony\Component\Cache\Adapter\FilesystemAdapter;
+
 $user_id = $_SESSION['user_id'];
 $username = $_SESSION['username'];
 
-// Get user wallet
-$stmt = $pdo->prepare("SELECT * FROM trxbalance WHERE user_id = ?");
-$stmt->execute([$user_id]);
-$wallet = $stmt->fetch();
+// Initialize Guzzle HTTP Client
+$httpClient = new Client([
+    'timeout' => 10,
+    'connect_timeout' => 5,
+    'headers' => [
+        'User-Agent' => 'TRX-Wallet/1.0',
+        'Accept' => 'application/json',
+        'Content-Type' => 'application/json'
+    ]
+]);
 
-// Get company settings
-$stmt = $pdo->prepare("SELECT setting_name, setting_value FROM company_settings WHERE 1");
-$stmt->execute();
-$settings = [];
-while ($row = $stmt->fetch()) {
-    $settings[$row['setting_name']] = $row['setting_value'];
+// Initialize Cache with fallback
+try {
+    $cache = new FilesystemAdapter(
+        'trx_launch_cache',
+        3600, // Default TTL: 1 hour
+        '../cache'
+    );
+} catch (Exception $e) {
+    // Fallback cache implementation
+    $cache = new class {
+        private $data = [];
+        
+        public function getItem($key) {
+            return new class($key, $this->data) {
+                private $key;
+                private $data;
+                private $value;
+                private $hit = false;
+                
+                public function __construct($key, &$data) {
+                    $this->key = $key;
+                    $this->data = &$data;
+                    if (isset($data[$key]) && $data[$key]['expires'] > time()) {
+                        $this->value = $data[$key]['value'];
+                        $this->hit = true;
+                    }
+                }
+                
+                public function isHit() { return $this->hit; }
+                public function get() { return $this->value; }
+                public function set($value) { $this->value = $value; return $this; }
+                public function expiresAfter($seconds) { 
+                    $this->data[$this->key] = [
+                        'value' => $this->value,
+                        'expires' => time() + $seconds
+                    ];
+                    return $this;
+                }
+            };
+        }
+        
+        public function save($item) { return true; }
+    };
 }
+
+// Get user wallet with caching
+function getUserWalletWithCache($pdo, $user_id, $cache) {
+    try {
+        $cacheKey = "user_wallet_{$user_id}";
+        $cachedWallet = $cache->getItem($cacheKey);
+        
+        if ($cachedWallet->isHit()) {
+            return $cachedWallet->get();
+        }
+        
+        $stmt = $pdo->prepare("SELECT * FROM trxbalance WHERE user_id = ?");
+        $stmt->execute([$user_id]);
+        $wallet = $stmt->fetch();
+        
+        if ($wallet) {
+            // Cache for 30 seconds
+            $cachedWallet->set($wallet);
+            $cachedWallet->expiresAfter(30);
+            $cache->save($cachedWallet);
+        }
+        
+        return $wallet;
+        
+    } catch (Exception $e) {
+        error_log("User Wallet Cache Error: " . $e->getMessage());
+        // Fallback to direct query
+        $stmt = $pdo->prepare("SELECT * FROM trxbalance WHERE user_id = ?");
+        $stmt->execute([$user_id]);
+        return $stmt->fetch();
+    }
+}
+
+// Get company settings with caching
+function getCompanySettingsWithCache($pdo, $cache) {
+    try {
+        $cacheKey = 'company_settings_launch';
+        $cachedSettings = $cache->getItem($cacheKey);
+        
+        if ($cachedSettings->isHit()) {
+            return $cachedSettings->get();
+        }
+        
+        $stmt = $pdo->prepare("SELECT setting_name, setting_value FROM company_settings WHERE 1");
+        $stmt->execute();
+        $settings = [];
+        while ($row = $stmt->fetch()) {
+            $settings[$row['setting_name']] = $row['setting_value'];
+        }
+        
+        // Cache for 1 hour
+        $cachedSettings->set($settings);
+        $cachedSettings->expiresAfter(3600);
+        $cache->save($cachedSettings);
+        
+        return $settings;
+        
+    } catch (Exception $e) {
+        error_log("Company Settings Cache Error: " . $e->getMessage());
+        // Fallback to direct database query
+        $stmt = $pdo->prepare("SELECT setting_name, setting_value FROM company_settings WHERE 1");
+        $stmt->execute();
+        $settings = [];
+        while ($row = $stmt->fetch()) {
+            $settings[$row['setting_name']] = $row['setting_value'];
+        }
+        return $settings;
+    }
+}
+
+/**
+ * Get TRX price with caching using Guzzle HTTP
+ */
+function getTRXPriceWithCache($httpClient, $cache) {
+    try {
+        $cacheKey = 'trx_price_usd_launch';
+        $cachedPrice = $cache->getItem($cacheKey);
+        
+        if ($cachedPrice->isHit()) {
+            return $cachedPrice->get();
+        }
+        
+        // Multiple API endpoints for redundancy
+        $apis = [
+            [
+                'url' => 'https://api.api-ninjas.com/v1/cryptoprice?symbol=TRXUSDT',
+                'headers' => ['X-Api-Key' => 'jRN/iU++CJrVw0zkBf9tBg==ekPzRifWfQ8jCTFe'],
+                'parser' => function($data) {
+                    return isset($data['price']) ? floatval($data['price']) : null;
+                }
+            ],
+            [
+                'url' => 'https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd',
+                'headers' => [],
+                'parser' => function($data) {
+                    return isset($data['tron']['usd']) ? floatval($data['tron']['usd']) : null;
+                }
+            ],
+            [
+                'url' => 'https://api.coinbase.com/v2/exchange-rates?currency=TRX',
+                'headers' => [],
+                'parser' => function($data) {
+                    return isset($data['data']['rates']['USD']) ? floatval($data['data']['rates']['USD']) : null;
+                }
+            ]
+        ];
+        
+        foreach ($apis as $api) {
+            try {
+                $response = $httpClient->get($api['url'], [
+                    'headers' => $api['headers'],
+                    'timeout' => 8
+                ]);
+                
+                if ($response->getStatusCode() === 200) {
+                    $data = json_decode($response->getBody()->getContents(), true);
+                    $price = $api['parser']($data);
+                    
+                    if ($price && $price > 0) {
+                        // Cache the price for 5 minutes
+                        $cachedPrice->set($price);
+                        $cachedPrice->expiresAfter(300);
+                        $cache->save($cachedPrice);
+                        
+                        return $price;
+                    }
+                }
+            } catch (RequestException $e) {
+                error_log("TRX Price API Error ({$api['url']}): " . $e->getMessage());
+                continue;
+            }
+        }
+        
+        // If all APIs fail, return cached value if exists (even if expired)
+        $expiredCache = $cache->getItem('trx_price_fallback_launch');
+        if ($expiredCache->isHit()) {
+            return $expiredCache->get();
+        }
+        
+    } catch (Exception $e) {
+        error_log("TRX Price Cache Error: " . $e->getMessage());
+    }
+    
+    return 0.067; // Ultimate fallback price
+}
+
+// Get user wallet and settings
+$wallet = getUserWalletWithCache($pdo, $user_id, $cache);
+$settings = getCompanySettingsWithCache($pdo, $cache);
+$trx_price = getTRXPriceWithCache($httpClient, $cache);
 
 $launch_fee = floatval($settings['launch_fee_trx'] ?? 10);
 $company_wallet = $settings['company_wallet_address'] ?? 'TCompanyWallet123';
@@ -39,14 +239,14 @@ $success = "";
 // Function to calculate tokens from TRX using bonding curve
 function calculateTokensFromTRX($trxAmount, $virtualTrx, $virtualTokens) {
     if ($trxAmount <= 0) return 0;
-    
+
     // Using constant product formula: x * y = k
     // tokens_out = virtual_tokens - (virtual_trx * virtual_tokens) / (virtual_trx + trx_in)
     $k = $virtualTrx * $virtualTokens;
     $newVirtualTrx = $virtualTrx + $trxAmount;
     $newVirtualTokens = $k / $newVirtualTrx;
     $tokensOut = $virtualTokens - $newVirtualTokens;
-    
+
     return $tokensOut;
 }
 
@@ -65,10 +265,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['launch_token'])) {
     $website_url = trim($_POST['website_url']);
     $twitter_url = trim($_POST['twitter_url']);
     $telegram_url = trim($_POST['telegram_url']);
-    
+
     // Calculate total cost including fees
     $total_cost_with_fee = $initial_buy_amount + $launch_fee;
-    
+
     // Handle image upload
     $image_url = '';
     if (isset($_FILES['token_image']) && $_FILES['token_image']['error'] === UPLOAD_ERR_OK) {
@@ -85,7 +285,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['launch_token'])) {
             $image_url = 'uploads/tokens/' . $filename;
         }
     }
-    
+
     // Validate inputs
     if (empty($token_name) || empty($token_symbol)) {
         $error = "Please fill in all required fields.";
@@ -196,12 +396,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['launch_token'])) {
                 
                 $pdo->commit();
                 
+                // Clear relevant caches
+                $cache->getItem("user_wallet_{$user_id}")->set(null);
+                $cache->getItem("user_tokens_{$user_id}")->set(null);
+                
                 $success = "Token launched successfully! Contract: " . $contract_address;
                 if ($initial_buy_amount > 0) {
                     $success .= "<br>Initial buy: " . number_format($tokens_from_initial_buy, 0) . " tokens for " . number_format($initial_buy_amount, 4) . " TRX";
                     $success .= "<br>Effective price: " . number_format($initial_price, 8) . " TRX per token";
                 }
                 $success .= "<br>Launch fee: " . $launch_fee . " TRX deducted";
+                
+                // Refresh wallet data
+                $wallet = getUserWalletWithCache($pdo, $user_id, $cache);
             } else {
                 throw new Exception("Failed to create token record");
             }
@@ -212,16 +419,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['launch_token'])) {
     }
 }
 
-// Get user's launched tokens
-$stmt = $pdo->prepare("
-    SELECT t.*, bc.current_progress 
-    FROM tokens t 
-    LEFT JOIN bonding_curves bc ON t.id = bc.token_id 
-    WHERE t.creator_id = ? 
-    ORDER BY t.launch_time DESC
-");
-$stmt->execute([$user_id]);
-$user_tokens = $stmt->fetchAll();
+// Get user's launched tokens with caching
+function getUserTokensWithCache($pdo, $user_id, $cache) {
+    try {
+        $cacheKey = "user_tokens_{$user_id}";
+        $cachedTokens = $cache->getItem($cacheKey);
+        
+        if ($cachedTokens->isHit()) {
+            return $cachedTokens->get();
+        }
+        
+        $stmt = $pdo->prepare("
+            SELECT t.*, bc.current_progress 
+            FROM tokens t 
+            LEFT JOIN bonding_curves bc ON t.id = bc.token_id 
+            WHERE t.creator_id = ? 
+            ORDER BY t.launch_time DESC
+        ");
+        $stmt->execute([$user_id]);
+        $tokens = $stmt->fetchAll();
+        
+        // Cache for 2 minutes
+        $cachedTokens->set($tokens);
+        $cachedTokens->expiresAfter(120);
+        $cache->save($cachedTokens);
+        
+        return $tokens;
+        
+    } catch (Exception $e) {
+        error_log("User Tokens Cache Error: " . $e->getMessage());
+        // Fallback to direct query
+        $stmt = $pdo->prepare("
+            SELECT t.*, 0 as current_progress 
+            FROM tokens t 
+            WHERE t.creator_id = ? 
+            ORDER BY t.launch_time DESC
+        ");
+        $stmt->execute([$user_id]);
+        return $stmt->fetchAll();
+    }
+}
+
+$user_tokens = getUserTokensWithCache($pdo, $user_id, $cache);
 ?>
 
 <!DOCTYPE html>
@@ -231,301 +470,31 @@ $user_tokens = $stmt->fetchAll();
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Launch Token</title>
     <link rel="stylesheet" href="../assets/css/dashboard.css">
-    <style>
-        /* Launch-specific styles - add more bottom spacing */
-        .launch-container {
-            padding-bottom: 60px !important; /* Override global padding */
-        }
-
-        .form-group {
-            margin-bottom: 20px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #fff;
-        }
-        
-        .form-group input,
-        .form-group textarea,
-        .form-group select {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid #333;
-            background: #111;
-            color: #fff;
-            font-size: 16px;
-        }
-        
-        .form-group input:focus,
-        .form-group textarea:focus {
-            outline: none;
-            border-color: #fff;
-        }
-        
-        .form-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-        }
-        
-        .initial-buy-section {
-            background: #111;
-            border: 1px solid #333;
-            padding: 20px;
-            margin: 20px 0;
-        }
-        
-        .initial-buy-header {
-            font-size: 18px;
-            font-weight: 600;
-            margin-bottom: 8px;
-            color: #fff;
-        }
-        
-        .initial-buy-subtitle {
-            color: #999;
-            font-size: 14px;
-            margin-bottom: 16px;
-        }
-        
-        .balance-info {
-            background: #222;
-            padding: 12px;
-            margin-bottom: 16px;
-            border: 1px solid #333;
-        }
-        
-        .balance-text {
-            color: #999;
-            font-size: 14px;
-        }
-        
-        .balance-amount {
-            color: #fff;
-            font-weight: 600;
-            font-size: 16px;
-        }
-        
-        .calculation-display {
-            background: #222;
-            border: 1px solid #333;
-            padding: 16px;
-            margin-top: 12px;
-        }
-        
-        .calc-row {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 8px;
-            font-size: 14px;
-        }
-        
-        .calc-row:last-child {
-            border-top: 1px solid #333;
-            padding-top: 8px;
-            font-weight: 600;
-        }
-        
-        .calc-label {
-            color: #999;
-        }
-        
-        .calc-value {
-            color: #fff;
-        }
-        
-        .bonding-curve-info {
-            background: #222;
-            border: 1px solid #333;
-            padding: 16px;
-            margin-bottom: 16px;
-            font-size: 12px;
-            color: #999;
-        }
-        
-        .bonding-curve-info h4 {
-            color: #fff;
-            margin-bottom: 8px;
-            font-size: 14px;
-        }
-        
-        .launch-btn {
-            width: 100%;
-            background: #fff;
-            color: #000;
-            border: none;
-            padding: 16px;
-            font-size: 18px;
-            font-weight: 600;
-            cursor: pointer;
-            text-transform: uppercase;
-            margin-bottom: 40px; /* Add bottom margin to launch button */
-        }
-        
-        .launch-btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
-        .token-card {
-            background: #111;
-            border: 1px solid #333;
-            padding: 20px;
-            margin-bottom: 15px;
-        }
-        
-        .token-card:last-child {
-            margin-bottom: 40px;
-        }
-        
-        .token-header {
-            display: flex;
-            align-items: center;
-            margin-bottom: 15px;
-        }
-        
-        .token-image {
-            width: 50px;
-            height: 50px;
-            border: 1px solid #333;
-            margin-right: 15px;
-            object-fit: cover;
-            background: #222;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #fff;
-            font-weight: bold;
-        }
-        
-        .token-info h3 {
-            margin: 0;
-            font-size: 18px;
-            color: #fff;
-        }
-        
-        .token-symbol {
-            color: #999;
-            font-size: 14px;
-        }
-        
-        .progress-bar {
-            width: 100%;
-            height: 8px;
-            background: #333;
-            margin: 10px 0;
-        }
-        
-        .progress-fill {
-            height: 100%;
-            background: #fff;
-        }
-        
-        .token-stats {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 15px;
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #333;
-        }
-        
-        .stat {
-            text-align: center;
-        }
-        
-        .stat-value {
-            font-size: 18px;
-            font-weight: 600;
-            color: #fff;
-        }
-        
-        .stat-label {
-            font-size: 12px;
-            color: #999;
-            text-transform: uppercase;
-        }
-        
-        .alert {
-            padding: 16px;
-            margin-bottom: 20px;
-            border: 1px solid #333;
-        }
-        
-        .alert-success {
-            background: #222;
-            color: #fff;
-        }
-        
-        .alert-error {
-            background: #222;
-            color: #fff;
-        }
-        
-        .alert-warning {
-            background: #222;
-            color: #fff;
-        }
-        
-        .insufficient-amount {
-            color: #ff6b6b;
-            font-weight: 600;
-            margin-top: 8px;
-        }
-
-        /* Ensure form has proper bottom spacing */
-        #launch-form {
-            margin-bottom: 30px;
-        }
-
-        /* Add bottom margin to the entire form container */
-        .launch-container form {
-            margin-bottom: 50px;
-        }
-
-        @media (max-width: 480px) {
-            .launch-container {
-                padding-bottom: 80px !important;
-            }
-            
-            .launch-btn {
-                margin-bottom: 50px;
-            }
-        }
-
-        @media (max-width: 360px) {
-            .launch-container {
-                padding-bottom: 100px !important;
-            }
-            
-            .launch-btn {
-                margin-bottom: 60px;
-            }
-        }
-    </style>
+    <link rel="stylesheet" href="../assets/css/launch.css">
 </head>
 <body>
     <div class="app">
-     
+        <div class="content">
+            <?php if (!empty($error)): ?>
+                <div class="alert alert-error"><?php echo $error; ?></div>
+            <?php endif; ?>
+            
+            <?php if (!empty($success)): ?>
+                <div class="alert alert-success"><?php echo $success; ?></div>
+            <?php endif; ?>
 
-        <?php if (!empty($error)): ?>
-            <div class="alert alert-error"><?php echo $error; ?></div>
-        <?php endif; ?>
-        
-        <?php if (!empty($success)): ?>
-            <div class="alert alert-success"><?php echo $success; ?></div>
-        <?php endif; ?>
-
-        <div class="launch-container">
             <?php if (!$wallet): ?>
                 <div class="alert alert-warning">
                     Please create a wallet first to launch tokens.
-                    <a href="../dashboard.php">Create Wallet</a>
+                    <a href="../dashboard.php" style="color: #ffc107; text-decoration: underline;">Create Wallet</a>
                 </div>
             <?php else: ?>
+                <div class="balance-display">
+                    <div class="balance-amount"><?php echo number_format($wallet['balance'], 4); ?> TRX</div>
+                    <div class="balance-label">Available Balance</div>
+                    <div class="balance-usd">≈ $<?php echo number_format($wallet['balance'] * $trx_price, 2); ?> USD</div>
+                </div>
+
                 <form method="POST" enctype="multipart/form-data" id="launch-form">
                     <div class="form-group">
                         <label for="token_name">Token Name *</label>
@@ -632,49 +601,47 @@ $user_tokens = $stmt->fetchAll();
             <?php endif; ?>
 
             <?php if (!empty($user_tokens)): ?>
-                <div style="margin-top: 40px;">
-                    <h2>Your Launched Tokens</h2>
-                    <?php foreach ($user_tokens as $token): ?>
-                        <div class="token-card">
-                            <div class="token-header">
-                                <?php if ($token['image_url']): ?>
-                                    <img src="../<?php echo htmlspecialchars($token['image_url']); ?>" 
-                                         alt="<?php echo htmlspecialchars($token['name']); ?>" class="token-image">
-                                <?php else: ?>
-                                    <div class="token-image">
-                                        <?php echo substr($token['symbol'], 0, 2); ?>
-                                    </div>
-                                <?php endif; ?>
-                                <div class="token-info">
-                                    <h3><?php echo htmlspecialchars($token['name']); ?></h3>
-                                    <div class="token-symbol"><?php echo htmlspecialchars($token['symbol']); ?></div>
+                <h2 class="section-title">Your Launched Tokens</h2>
+                <?php foreach ($user_tokens as $token): ?>
+                    <div class="token-card">
+                        <div class="token-header">
+                            <?php if ($token['image_url']): ?>
+                                <img src="../<?php echo htmlspecialchars($token['image_url']); ?>" 
+                                     alt="<?php echo htmlspecialchars($token['name']); ?>" class="token-image">
+                            <?php else: ?>
+                                <div class="token-image">
+                                    <?php echo substr($token['symbol'], 0, 2); ?>
                                 </div>
-                            </div>
-                            
-                            <div class="progress-bar">
-                                <div class="progress-fill" style="width: <?php echo $token['current_progress']; ?>%"></div>
-                            </div>
-                            <div style="text-align: center; margin-top: 5px; font-size: 12px; color: #999;">
-                                Bonding Curve Progress: <?php echo number_format($token['current_progress'], 2); ?>%
-                            </div>
-
-                            <div class="token-stats">
-                                <div class="stat">
-                                    <div class="stat-value"><?php echo number_format($token['current_price'], 8); ?></div>
-                                    <div class="stat-label">Price (TRX)</div>
-                                </div>
-                                <div class="stat">
-                                    <div class="stat-value"><?php echo number_format($token['market_cap'], 2); ?></div>
-                                    <div class="stat-label">Market Cap</div>
-                                </div>
-                                <div class="stat">
-                                    <div class="stat-value"><?php echo $token['total_transactions']; ?></div>
-                                    <div class="stat-label">Transactions</div>
-                                </div>
+                            <?php endif; ?>
+                            <div class="token-info">
+                                <h3><?php echo htmlspecialchars($token['name']); ?></h3>
+                                <div class="token-symbol"><?php echo htmlspecialchars($token['symbol']); ?></div>
                             </div>
                         </div>
-                    <?php endforeach; ?>
-                </div>
+                        
+                        <div class="progress-bar">
+                            <div class="progress-fill" style="width: <?php echo $token['current_progress']; ?>%"></div>
+                        </div>
+                        <div style="text-align: center; margin-top: 5px; font-size: 12px; color: #999;">
+                            Bonding Curve Progress: <?php echo number_format($token['current_progress'], 2); ?>%
+                        </div>
+
+                        <div class="token-stats">
+                            <div class="stat">
+                                <div class="stat-value"><?php echo number_format($token['current_price'], 8); ?></div>
+                                <div class="stat-label">Price (TRX)</div>
+                            </div>
+                            <div class="stat">
+                                <div class="stat-value"><?php echo number_format($token['market_cap'], 2); ?></div>
+                                <div class="stat-label">Market Cap</div>
+                            </div>
+                            <div class="stat">
+                                <div class="stat-value"><?php echo $token['total_transactions']; ?></div>
+                                <div class="stat-label">Transactions</div>
+                            </div>
+                        </div>
+                    </div>
+                <?php endforeach; ?>
             <?php endif; ?>
         </div>
 
@@ -753,6 +720,32 @@ $user_tokens = $stmt->fetchAll();
         
         // Initial calculation
         updateCalculations();
+
+        // Auto-hide alerts after 5 seconds
+        document.addEventListener('DOMContentLoaded', function() {
+            const alerts = document.querySelectorAll('.alert');
+            alerts.forEach(alert => {
+                setTimeout(() => {
+                    alert.style.opacity = '0';
+                    setTimeout(() => {
+                        alert.style.display = 'none';
+                    }, 300);
+                }, 5000);
+            });
+        });
+
+        // Cache warming on page visibility
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden) {
+                // Warm up cache by making a background request
+                fetch(window.location.href, {
+                    method: 'HEAD',
+                    cache: 'no-cache'
+                }).catch(() => {
+                    // Ignore errors, this is just cache warming
+                });
+            }
+        });
     </script>
 </body>
 </html>
